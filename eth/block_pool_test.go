@@ -1,9 +1,9 @@
 package eth
 
 import (
-	"bytes"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"sync"
 	"testing"
@@ -11,80 +11,72 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethutil"
-	ethlogger "github.com/ethereum/go-ethereum/logger"
+	"github.com/ethereum/go-ethereum/logger"
+	"github.com/ethereum/go-ethereum/pow"
 )
 
-var sys = ethlogger.NewStdLogSystem(os.Stdout, log.LstdFlags, ethlogger.LogLevel(ethlogger.DebugDetailLevel))
+var logsys = logger.NewStdLogSystem(os.Stdout, log.LstdFlags, logger.LogLevel(logger.DebugDetailLevel))
 
-type testChainManager struct {
-	knownBlock func(hash []byte) bool
-	addBlock   func(*types.Block) error
-	checkPoW   func(*types.Block) bool
+type blockPoolTester struct {
+	hashPool      *testHashPool
+	lock          sync.RWMutex
+	refBlockChain map[int][]int
+	blockChain    map[int][]int
 }
 
-func (self *testChainManager) KnownBlock(hash []byte) bool {
-	if self.knownBlock != nil {
-		return self.knownBlock(hash)
-	}
-	return false
+func (self *blockPoolTester) hasBlock(block []byte) (ok bool) {
+	self.lock.RLock()
+	defer self.lock.RUnlock()
+	indexes := self.hashPool.hashesToIndexes([][]byte{block})
+	i := indexes[0]
+	_, ok = self.blockChain[i]
+	return
 }
 
-func (self *testChainManager) AddBlock(block *types.Block) error {
-	if self.addBlock != nil {
-		return self.addBlock(block)
+func (self *blockPoolTester) insertChain(blocks types.Blocks) error {
+	self.lock.RLock()
+	defer self.lock.RUnlock()
+	var parent, child int
+	var children []int
+	var ok bool
+	for _, block := range blocks {
+		child = self.hashPool.hashesToIndexes([][]byte{block.Hash()})[0]
+		_, ok = self.blockChain[child]
+		continue // already in chain
+		parent = self.hashPool.hashesToIndexes([][]byte{block.PrevHash})[0]
+		_, ok = self.blockChain[parent]
+		if !ok {
+			return fmt.Errorf("parent %v not in blockchain ", parent)
+		}
+		children, ok = self.refBlockChain[parent]
+		if ok {
+			ok = false
+			for _, c := range children {
+				if c == child {
+					ok = true
+				}
+			}
+			if !ok {
+				return fmt.Errorf("invalid block %v", child)
+			}
+		} else {
+			// accept any blocks if parent not in refBlockChain
+			self.blockChain[parent] = append(children, child)
+		}
+		self.blockChain[child] = nil
 	}
 	return nil
 }
 
-func (self *testChainManager) CheckPoW(block *types.Block) bool {
-	if self.checkPoW != nil {
-		return self.checkPoW(block)
-	}
-	return false
-}
-
-func knownBlock(hashes ...[]byte) (f func([]byte) bool) {
-	f = func(block []byte) bool {
-		for _, hash := range hashes {
-			if bytes.Compare(block, hash) == 0 {
-				return true
-			}
-		}
-		return false
-	}
-	return
-}
-
-func addBlock(hashes ...[]byte) (f func(*types.Block) error) {
-	f = func(block *types.Block) error {
-		for _, hash := range hashes {
-			if bytes.Compare(block.Hash(), hash) == 0 {
-				return fmt.Errorf("invalid by test")
-			}
-		}
-		return nil
-	}
-	return
-}
-
-func checkPoW(hashes ...[]byte) (f func(*types.Block) bool) {
-	f = func(block *types.Block) bool {
-		for _, hash := range hashes {
-			if bytes.Compare(block.Hash(), hash) == 0 {
-				return false
-			}
-		}
-		return true
-	}
-	return
-}
-
-func newTestChainManager(knownBlocks [][]byte, invalidBlocks [][]byte, invalidPoW [][]byte) *testChainManager {
-	return &testChainManager{
-		knownBlock: knownBlock(knownBlocks...),
-		addBlock:   addBlock(invalidBlocks...),
-		checkPoW:   checkPoW(invalidPoW...),
-	}
+func (self *blockPoolTester) verifyPoW(pblock pow.Block) bool {
+	// block, _ := pblock.(*types.Block)
+	// i := self.hashPool.hashesToIndexes([][]byte{block.Hash()})[0]
+	// for _, j := range self.invalidPoWhashes {
+	// 	if i == j {
+	// 		return false
+	// 	}
+	// }
+	return true
 }
 
 type intToHash map[int][]byte
@@ -94,22 +86,16 @@ type hashToInt map[string]int
 type testHashPool struct {
 	intToHash
 	hashToInt
+	lock sync.Mutex
 }
 
 func newHash(i int) []byte {
 	return crypto.Sha3([]byte(string(i)))
 }
 
-func newTestBlockPool(knownBlockIndexes []int, invalidBlockIndexes []int, invalidPoWIndexes []int) (hashPool *testHashPool, blockPool *BlockPool) {
-	hashPool = &testHashPool{make(intToHash), make(hashToInt)}
-	knownBlocks := hashPool.indexesToHashes(knownBlockIndexes)
-	invalidBlocks := hashPool.indexesToHashes(invalidBlockIndexes)
-	invalidPoW := hashPool.indexesToHashes(invalidPoWIndexes)
-	blockPool = NewBlockPool(newTestChainManager(knownBlocks, invalidBlocks, invalidPoW))
-	return
-}
-
 func (self *testHashPool) indexesToHashes(indexes []int) (hashes [][]byte) {
+	self.lock.Lock()
+	defer self.lock.Unlock()
 	for _, i := range indexes {
 		hash, found := self.intToHash[i]
 		if !found {
@@ -123,6 +109,8 @@ func (self *testHashPool) indexesToHashes(indexes []int) (hashes [][]byte) {
 }
 
 func (self *testHashPool) hashesToIndexes(hashes [][]byte) (indexes []int) {
+	self.lock.Lock()
+	defer self.lock.Unlock()
 	for _, hash := range hashes {
 		i, found := self.hashToInt[string(hash)]
 		if !found {
@@ -133,63 +121,66 @@ func (self *testHashPool) hashesToIndexes(hashes [][]byte) (indexes []int) {
 	return
 }
 
-type protocolChecker struct {
+type peerTester struct {
 	blockHashesRequests []int
 	blocksRequests      [][]int
-	invalidBlocks       []error
+	peerErrors          []int
 	hashPool            *testHashPool
 	lock                sync.Mutex
+	id                  string
+	td                  *big.Int
+	currentBlock        int
 }
 
+func (self *peerTester) AddPeer(blockPool blockPool) bool {
+	hash := self.hashPool.indexesToHashes([]int{self.currentBlock})[0]
+	return blockPool.AddPeer(self.td, hash, self.id, self.requestBlockHashes, self.requestBlocks, self.peerError)
+}
+
+// peer callbacks are simply recording the hash and blockrequests with indexes
 // -1 is special: not found (a hash never seen)
-func (self *protocolChecker) requestBlockHashesCallBack() (requestBlockHashesCallBack func([]byte) error) {
-	requestBlockHashesCallBack = func(hash []byte) error {
-		indexes := self.hashPool.hashesToIndexes([][]byte{hash})
-		self.lock.Lock()
-		defer self.lock.Unlock()
-		self.blockHashesRequests = append(self.blockHashesRequests, indexes[0])
-		return nil
-	}
-	return
+func (self *peerTester) requestBlockHashes(hash []byte) error {
+	indexes := self.hashPool.hashesToIndexes([][]byte{hash})
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	self.blockHashesRequests = append(self.blockHashesRequests, indexes[0])
+	return nil
 }
 
-func (self *protocolChecker) requestBlocksCallBack() (requestBlocksCallBack func([][]byte) error) {
-	requestBlocksCallBack = func(hashes [][]byte) error {
-		indexes := self.hashPool.hashesToIndexes(hashes)
-		self.lock.Lock()
-		defer self.lock.Unlock()
-		self.blocksRequests = append(self.blocksRequests, indexes)
-		return nil
-	}
-	return
+func (self *peerTester) requestBlocks(hashes [][]byte) error {
+	indexes := self.hashPool.hashesToIndexes(hashes)
+	self.lock.Lock()
+	defer self.lock.Unlock()
+	self.blocksRequests = append(self.blocksRequests, indexes)
+	return nil
 }
 
-func (self *protocolChecker) invalidBlockCallBack() (invalidBlockCallBack func(error)) {
-	invalidBlockCallBack = func(err error) {
-		self.invalidBlocks = append(self.invalidBlocks, err)
+func (self *peerTester) peerError(code int, format string, params ...interface{}) {
+	self.peerErrors = append(self.peerErrors, code)
+}
+
+func newTestBlockPool() (hashPool *testHashPool, blockPool *BlockPool, b *blockPoolTester) {
+	hashPool = &testHashPool{intToHash: make(intToHash), hashToInt: make(hashToInt)}
+	b = &blockPoolTester{
+		hashPool:      hashPool,
+		blockChain:    make(map[int][]int),
+		refBlockChain: make(map[int][]int),
 	}
+	blockPool = NewBlockPool(b.hasBlock, b.insertChain, b.verifyPoW)
 	return
 }
 
 func TestAddPeer(t *testing.T) {
-	ethlogger.AddLogSystem(sys)
-	knownBlockIndexes := []int{0, 1}
-	invalidBlockIndexes := []int{2, 3}
-	invalidPoWIndexes := []int{4, 5}
-	hashPool, blockPool := newTestBlockPool(knownBlockIndexes, invalidBlockIndexes, invalidPoWIndexes)
-	// TODO:
-	// hashPool, blockPool, blockChainChecker = newTestBlockPool(knownBlockIndexes, invalidBlockIndexes, invalidPoWIndexes)
-	peer0 := &protocolChecker{
-		// blockHashesRequests: make([]int),
-		// blocksRequests:      make([][]int),
-		// invalidBlocks:       make([]error),
+	logger.AddLogSystem(logsys)
+	hashPool, blockPool, _ := newTestBlockPool()
+	// hashPool, blockPool, blockPoolTester := newTestBlockPool()
+	peer0 := &peerTester{
+		id:       "peer0",
+		td:       ethutil.Big1,
 		hashPool: hashPool,
 	}
-	best := blockPool.AddPeer(ethutil.Big1, newHash(100), "0",
-		peer0.requestBlockHashesCallBack(),
-		peer0.requestBlocksCallBack(),
-		peer0.invalidBlockCallBack(),
-	)
+	blockPool.Start()
+	best := peer0.AddPeer(blockPool)
 	if !best {
 		t.Errorf("peer not accepted as best")
 	}
