@@ -151,7 +151,9 @@ func (self *BlockPool) AddPeer(td *big.Int, currentBlock []byte, peerId string, 
 		currentTD = self.peer.td
 	}
 	if td.Cmp(currentTD) > 0 {
-		self.peer.stop(peer)
+		if self.peer != nil {
+			self.peer.stop(peer)
+		}
 		peer.start(self.peer)
 		poolLogger.Debugf("peer %v promoted to best peer", peerId)
 		self.peer = peer
