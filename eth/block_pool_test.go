@@ -179,11 +179,53 @@ func TestAddPeer(t *testing.T) {
 		td:       ethutil.Big1,
 		hashPool: hashPool,
 	}
+	peer1 := &peerTester{
+		id:       "peer1",
+		td:       ethutil.Big2,
+		hashPool: hashPool,
+	}
+	peer2 := &peerTester{
+		id:       "peer2",
+		td:       ethutil.Big3,
+		hashPool: hashPool,
+	}
 	blockPool.Start()
 	best := peer0.AddPeer(blockPool)
 	if !best {
-		t.Errorf("peer not accepted as best")
+		t.Errorf("peer0 (TD=1) not accepted as best")
 	}
-	blockPool.Stop()
+	best, peer := blockPool.getPeer("peer0")
+	if peer.id != "peer0" {
+		t.Errorf("peer0 (TD=1) not set as best")
+	}
+
+	best = peer2.AddPeer(blockPool)
+	if !best {
+		t.Errorf("peer2 (TD=3) not accepted as best")
+	}
+	best, peer = blockPool.getPeer("peer2")
+	if peer.id != "peer2" {
+		t.Errorf("peer2 (TD=3) not set as best")
+	}
+
+	best = peer1.AddPeer(blockPool)
+	if best {
+		t.Errorf("peer1 (TD=2) accepted as best")
+	}
+	best, peer = blockPool.getPeer("peer2")
+	if peer.id != "peer2" {
+		t.Errorf("peer2 (TD=3) not set any more as best")
+	}
+
+	blockPool.RemovePeer("peer2")
+	best, peer = blockPool.getPeer("peer2")
+	if peer != nil {
+		t.Errorf("peer2 not removed")
+	}
+
+	best, peer = blockPool.getPeer("peer1")
+	if peer.id != "peer1" {
+		t.Errorf("existing peer1 (TD=2) set as best peer")
+	}
 
 }
