@@ -147,19 +147,28 @@ func (self *BlockPool) AddPeer(td *big.Int, currentBlock []byte, peerId string, 
 		peerError:          peerError,
 		sections:           make(map[string]*section),
 	}
+	self.peers[peerId] = peer
+	poolLogger.Debugf("add new peer %v with td %v", peerId, td)
+
+	// check peer current head
+	if self.hasBlock(currentBlock) {
+		// peer not ahead
+		return false
+	}
 	node := self.get(currentBlock)
 	if node == nil {
+		// node created if not exist
 		node = &poolNode{
 			hash:    currentBlock,
 			section: &section{},
 			peer:    peerId,
 			td:      td,
 		}
+		node.section.top = node
 		self.set(currentBlock, node)
 	}
 	peer.addRoot(node)
-	self.peers[peerId] = peer
-	poolLogger.Debugf("add new peer %v with td %v", peerId, td)
+
 	currentTD := ethutil.Big0
 	if self.peer != nil {
 		currentTD = self.peer.td
