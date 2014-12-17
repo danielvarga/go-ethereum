@@ -60,6 +60,28 @@ type blockPool interface {
 	RemovePeer(peerId string)
 }
 
+<<<<<<< HEAD
+=======
+const (
+	ProtocolVersion    = 43
+	NetworkId          = 0
+	ProtocolLength     = uint64(8)
+	ProtocolMaxMsgSize = 10 * 1024 * 1024
+)
+
+// eth protocol message codes
+const (
+	StatusMsg = iota
+	GetTxMsg  // unused
+	TxMsg
+	GetBlockHashesMsg
+	BlockHashesMsg
+	GetBlocksMsg
+	BlocksMsg
+	NewBlockMsg
+)
+
+>>>>>>> 27405881ece39ae21198a42f68b961c5c842429d
 // message structs used for rlp decoding
 type newBlockMsgData struct {
 	Block *types.Block
@@ -281,8 +303,7 @@ func (self *ethProtocol) handleStatus() error {
 
 	self.peer.Infof("Peer is [eth] capable (%d/%d). TD=%v H=%x\n", status.ProtocolVersion, status.NetworkId, status.TD, status.CurrentBlock[:4])
 
-	//self.blockPool.AddPeer(status.TD, status.CurrentBlock, self.id, self.requestBlockHashes, self.requestBlocks, self.protoErrorDisconnect)
-	self.peer.Infoln("AddPeer(IGNORED)")
+	self.blockPool.AddPeer(status.TD, status.CurrentBlock, self.id, self.requestBlockHashes, self.requestBlocks, self.protoErrorDisconnect)
 
 	return nil
 }
