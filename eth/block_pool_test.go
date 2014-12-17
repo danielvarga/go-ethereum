@@ -175,26 +175,29 @@ func TestAddPeer(t *testing.T) {
 	hashPool, blockPool, _ := newTestBlockPool()
 	// hashPool, blockPool, blockPoolTester := newTestBlockPool()
 	peer0 := &peerTester{
-		id:       "peer0",
-		td:       ethutil.Big1,
-		hashPool: hashPool,
+		id:           "peer0",
+		td:           ethutil.Big1,
+		currentBlock: 0,
+		hashPool:     hashPool,
 	}
 	peer1 := &peerTester{
-		id:       "peer1",
-		td:       ethutil.Big2,
-		hashPool: hashPool,
+		id:           "peer1",
+		td:           ethutil.Big2,
+		currentBlock: 1,
+		hashPool:     hashPool,
 	}
 	peer2 := &peerTester{
-		id:       "peer2",
-		td:       ethutil.Big3,
-		hashPool: hashPool,
+		id:           "peer2",
+		td:           ethutil.Big3,
+		currentBlock: 2,
+		hashPool:     hashPool,
 	}
 	blockPool.Start()
 	best := peer0.AddPeer(blockPool)
 	if !best {
 		t.Errorf("peer0 (TD=1) not accepted as best")
 	}
-	best, peer := blockPool.getPeer("peer0")
+	peer, best := blockPool.getPeer("peer0")
 	if peer.id != "peer0" {
 		t.Errorf("peer0 (TD=1) not set as best")
 	}
@@ -203,7 +206,7 @@ func TestAddPeer(t *testing.T) {
 	if !best {
 		t.Errorf("peer2 (TD=3) not accepted as best")
 	}
-	best, peer = blockPool.getPeer("peer2")
+	peer, best = blockPool.getPeer("peer2")
 	if peer.id != "peer2" {
 		t.Errorf("peer2 (TD=3) not set as best")
 	}
@@ -212,20 +215,66 @@ func TestAddPeer(t *testing.T) {
 	if best {
 		t.Errorf("peer1 (TD=2) accepted as best")
 	}
-	best, peer = blockPool.getPeer("peer2")
+	peer, best = blockPool.getPeer("peer2")
 	if peer.id != "peer2" {
 		t.Errorf("peer2 (TD=3) not set any more as best")
 	}
 
 	blockPool.RemovePeer("peer2")
-	best, peer = blockPool.getPeer("peer2")
+	peer, best = blockPool.getPeer("peer2")
 	if peer != nil {
 		t.Errorf("peer2 not removed")
 	}
 
-	best, peer = blockPool.getPeer("peer1")
+	peer, best = blockPool.getPeer("peer1")
 	if peer.id != "peer1" {
 		t.Errorf("existing peer1 (TD=2) set as best peer")
+	}
+
+	blockPool.RemovePeer("peer1")
+	peer, best = blockPool.getPeer("peer1")
+	if peer != nil {
+		t.Errorf("peer1 not removed")
+	}
+
+	peer, best = blockPool.getPeer("peer0")
+	if peer.id != "peer0" {
+		t.Errorf("existing peer0 (TD=1) set as best peer")
+	}
+
+	blockPool.RemovePeer("peer0")
+	peer, best = blockPool.getPeer("peer0")
+	if peer != nil {
+		t.Errorf("peer1 not removed")
+	}
+
+	// adding back earlier peer ok
+	peer0.currentBlock = 3
+	best = peer0.AddPeer(blockPool)
+	if !best {
+		t.Errorf("peer0 (TD=1) not accepted as best")
+	}
+
+	peer, best = blockPool.getPeer("peer0")
+	if peer.id != "peer0" {
+		t.Errorf("peer0 (TD=1) not set as best")
+	}
+
+	if len(peer0.blockHashesRequests) != 3 ||
+		peer0.blockHashesRequests[0] != 0 || // on first connect
+		peer0.blockHashesRequests[1] != 0 || // after fallback
+		peer0.blockHashesRequests[2] != 3 { // after 2nd connect
+		t.Errorf("incorrect hash requests for peer0: %v", peer0.blockHashesRequests)
+	}
+
+	if len(peer1.blockHashesRequests) != 1 ||
+		peer1.blockHashesRequests[0] != 1 {
+		t.Errorf("incorrect hash requests for peer1 : %v", peer1.blockHashesRequests)
+	}
+
+	if len(peer2.blockHashesRequests) != 1 ||
+		peer2.blockHashesRequests[0] != 2 {
+		t.Errorf("incorrect hash requests  for peer2: %v", peer2.blockHashesRequests)
 	}
 
 }

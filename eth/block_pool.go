@@ -30,6 +30,7 @@ const (
 type poolNode struct {
 	lock        sync.RWMutex
 	hash        []byte
+	td          *big.Int
 	block       *types.Block
 	child       *poolNode
 	parent      *poolNode
@@ -136,6 +137,7 @@ func (self *BlockPool) AddPeer(td *big.Int, currentBlock []byte, peerId string, 
 	if self.peers[peerId] != nil {
 		panic("peer already added")
 	}
+
 	peer := &peerInfo{
 		td:                 td,
 		currentBlock:       currentBlock,
@@ -145,6 +147,17 @@ func (self *BlockPool) AddPeer(td *big.Int, currentBlock []byte, peerId string, 
 		peerError:          peerError,
 		sections:           make(map[string]*section),
 	}
+	node := self.get(currentBlock)
+	if node == nil {
+		node = &poolNode{
+			hash:    currentBlock,
+			section: &section{},
+			peer:    peerId,
+			td:      td,
+		}
+		self.set(currentBlock, node)
+	}
+	peer.addRoot(node)
 	self.peers[peerId] = peer
 	poolLogger.Debugf("add new peer %v with td %v", peerId, td)
 	currentTD := ethutil.Big0
@@ -167,15 +180,15 @@ func (self *BlockPool) AddPeer(td *big.Int, currentBlock []byte, peerId string, 
 func (self *BlockPool) RemovePeer(peerId string) {
 	self.peersLock.Lock()
 	defer self.peersLock.Unlock()
-	peer := self.peers[peerId]
-	if peer == nil {
+	peer, ok := self.peers[peerId]
+	if !ok {
 		return
 	}
-	self.peers[peerId] = nil
-	poolLogger.Debugf("remove peer %v", peerId[0:4])
+	delete(self.peers, peerId)
+	poolLogger.Debugf("remove peer %v", peerId)
 
 	// if current best peer is removed, need find a better one
-	if self.peer != nil && peerId == self.peer.id {
+	if self.peer == peer {
 		var newPeer *peerInfo
 		max := ethutil.Big0
 		// peer with the highest self-acclaimed TD is chosen
@@ -185,10 +198,11 @@ func (self *BlockPool) RemovePeer(peerId string) {
 				newPeer = info
 			}
 		}
-		self.peer.stop(peer)
-		peer.start(self.peer)
+		self.peer = newPeer
+		peer.stop(newPeer)
 		if newPeer != nil {
-			poolLogger.Debugf("peer %v with td %v promoted to best peer", newPeer.id[0:4], newPeer.td)
+			poolLogger.Debugf("peer %v with td %v promoted to best peer", newPeer.id, newPeer.td)
+			newPeer.start(peer)
 		} else {
 			poolLogger.Warnln("no peers left")
 		}
@@ -682,7 +696,7 @@ func (self *BlockPool) getPeer(peerId string) (*peerInfo, bool) {
 	}
 	info, ok := self.peers[peerId]
 	if !ok {
-		panic("unknown peer")
+		return nil, false
 	}
 	return info, false
 }
@@ -696,6 +710,7 @@ func (self *peerInfo) addSection(hash []byte, section *section) {
 func (self *peerInfo) addRoot(node *poolNode) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
+	poolLogger.Debugf("root node %x added to %s", node.hash[0:4], self.id)
 	self.roots = append(self.roots, node)
 }
 
@@ -704,16 +719,21 @@ func (self *peerInfo) start(peer *peerInfo) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
 	self.quitC = make(chan bool)
+	poolLogger.Debugf("starting block hash requests starting from orphan blocks for %s", self.id)
+
+	var roots []*poolNode
 	for _, root := range self.roots {
+		poolLogger.Debugf("root node %x", root.hash[0:4])
 		root.sectionRLock()
-		if root.section.bottom != nil {
-			if root.parent == nil {
-				self.requestBlockHashes(root.hash)
-			}
+		if root.parent == nil {
+			poolLogger.Debugf("orphan root node %x: request hashes", root.hash[0:4])
+			self.requestBlockHashes(root.hash)
+			roots = append(roots, root)
 		}
 		root.sectionRUnlock()
 	}
-	self.roots = nil
+	self.roots = roots
+	poolLogger.Debugf("starting new processes for %s", self.id)
 	self.controlSections(peer, true)
 }
 
@@ -722,24 +742,33 @@ func (self *peerInfo) stop(peer *peerInfo) {
 	self.lock.RLock()
 	defer self.lock.RUnlock()
 	close(self.quitC)
+	poolLogger.Debugf("pausing block requests for %s", self.id)
 	self.controlSections(peer, false)
 }
 
 func (self *peerInfo) controlSections(peer *peerInfo, on bool) {
+	poolLogger.Debugf("processes for %s", self.id)
 	if peer != nil {
 		peer.lock.RLock()
 		defer peer.lock.RUnlock()
+		poolLogger.Debugf("processes not found for %s", peer.id)
 	}
+	poolLogger.Debugf("processes for %s", self.id)
+
 	for hash, section := range self.sections {
+		poolLogger.Debugf("section %x", hash[0:4])
+
 		if section.done() {
 			delete(self.sections, hash)
 			continue
 		}
 		var found bool
 		if peer != nil {
+			poolLogger.Debugf("processes not found for %s", peer.id)
 			_, found = peer.sections[hash]
 		}
 
+		poolLogger.Debugf("processes found for %s", self.id)
 		// switch on processes not found in old peer
 		// and switch off processes not found in new peer
 		if !found {
