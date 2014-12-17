@@ -172,6 +172,11 @@ func newEth(t *testing.T) *ethProtocolTester {
 	}
 }
 
+func (self *ethProtocolTester) reset() {
+	self.rw = &testMsgReadWriter{in: make(chan p2p.Msg, 10)}
+	self.quit = make(chan error)
+}
+
 func (self *ethProtocolTester) checkError(expCode int, delay time.Duration) (err error) {
 	var timer = time.After(delay)
 	select {
@@ -221,13 +226,6 @@ func (self *ethProtocolTester) run() {
 	self.quit <- err
 }
 
-func (self *ethProtocolTester) reset() {
-	self.quit = make(chan error)
-	self.rw = &testMsgReadWriter{in: make(chan p2p.Msg, 10)}
-	err := runEthProtocol(self.txPool, self.chainManager, self.blockPool, testPeer(), self.rw)
-	self.quit <- err
-}
-
 func TestStatusMsgErrors(t *testing.T) {
 	logger.AddLogSystem(sys)
 	eth := newEth(t)
@@ -238,17 +236,34 @@ func TestStatusMsgErrors(t *testing.T) {
 	go eth.run()
 	statusMsg := p2p.NewMsg(4)
 	eth.In(statusMsg)
-	delay := 2 * time.Second
+	delay := 1 * time.Second
 	eth.checkError(ErrNoStatusMsg, delay)
 	var status statusMsgData
 	eth.checkMsg(0, StatusMsg, &status) // first outgoing msg should be StatusMsg
 	if status.TD.Cmp(td) != 0 ||
+		status.ProtocolVersion != ProtocolVersion ||
+		status.NetworkId != NetworkId ||
+		status.TD.Cmp(td) != 0 ||
 		bytes.Compare(status.CurrentBlock, currentBlock) != 0 ||
 		bytes.Compare(status.GenesisBlock, genesis) != 0 {
 		t.Errorf("incorrect outgoing status")
 	}
 
-	statusMsg = p2p.NewMsg(0, td, currentBlock, []byte{3})
+	eth.reset()
+	go eth.run()
+	statusMsg = p2p.NewMsg(0, uint32(48), uint32(0), td, currentBlock, genesis)
+	eth.In(statusMsg)
+	eth.checkError(ErrProtocolVersionMismatch, delay)
+
+	eth.reset()
+	go eth.run()
+	statusMsg = p2p.NewMsg(0, uint32(49), uint32(1), td, currentBlock, genesis)
+	eth.In(statusMsg)
+	eth.checkError(ErrNetworkIdMismatch, delay)
+
+	eth.reset()
+	go eth.run()
+	statusMsg = p2p.NewMsg(0, uint32(49), uint32(0), td, currentBlock, []byte{3})
 	eth.In(statusMsg)
 	eth.checkError(ErrGenesisBlockMismatch, delay)
 
