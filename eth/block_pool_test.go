@@ -22,6 +22,7 @@ type blockPoolTester struct {
 	lock          sync.RWMutex
 	refBlockChain map[int][]int
 	blockChain    map[int][]int
+	t             *testing.T
 }
 
 func (self *blockPoolTester) hasBlock(block []byte) (ok bool) {
@@ -77,6 +78,29 @@ func (self *blockPoolTester) verifyPoW(pblock pow.Block) bool {
 	// 	}
 	// }
 	return true
+}
+
+func arrayEq(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (self *blockPoolTester) checkBlockChain(blockChain map[int][]int) {
+	for k, v := range blockChain {
+		vv, ok := self.blockChain[k]
+		if !ok || !arrayEq(v, vv) {
+			self.t.Errorf("blockchain incorrect on %v -> %v (!= %v)", k, vv, v)
+		}
+	}
 }
 
 type intToHash map[int][]byte
@@ -159,9 +183,10 @@ func (self *peerTester) peerError(code int, format string, params ...interface{}
 	self.peerErrors = append(self.peerErrors, code)
 }
 
-func newTestBlockPool() (hashPool *testHashPool, blockPool *BlockPool, b *blockPoolTester) {
+func newTestBlockPool(t *testing.T) (hashPool *testHashPool, blockPool *BlockPool, b *blockPoolTester) {
 	hashPool = &testHashPool{intToHash: make(intToHash), hashToInt: make(hashToInt)}
 	b = &blockPoolTester{
+		t:             t,
 		hashPool:      hashPool,
 		blockChain:    make(map[int][]int),
 		refBlockChain: make(map[int][]int),
@@ -172,7 +197,7 @@ func newTestBlockPool() (hashPool *testHashPool, blockPool *BlockPool, b *blockP
 
 func TestAddPeer(t *testing.T) {
 	logger.AddLogSystem(logsys)
-	hashPool, blockPool, _ := newTestBlockPool()
+	hashPool, blockPool, _ := newTestBlockPool(t)
 	// hashPool, blockPool, blockPoolTester := newTestBlockPool()
 	peer0 := &peerTester{
 		id:           "peer0",
@@ -276,5 +301,30 @@ func TestAddPeer(t *testing.T) {
 		peer2.blockHashesRequests[0] != 2 {
 		t.Errorf("incorrect hash requests  for peer2: %v", peer2.blockHashesRequests)
 	}
+	blockPool.Stop()
+
+}
+
+func TestSimpleChain(t *testing.T) {
+	logger.AddLogSystem(logsys)
+	hashPool, blockPool, blockPoolTester := newTestBlockPool(t)
+	blockPoolTester.refBlockChain[0] = nil
+	blockPoolTester.blockChain[0] = nil
+	// hashPool, blockPool, blockPoolTester := newTestBlockPool()
+	blockPool.Start()
+
+	peer0 := &peerTester{
+		id:           "peer0",
+		td:           ethutil.Big1,
+		currentBlock: 0,
+		hashPool:     hashPool,
+	}
+	peer0.AddPeer(blockPool)
+	// no request on known block
+	if len(peer0.blockHashesRequests) != 0 {
+		t.Errorf("incorrect hash requests for peer0: %v", peer0.blockHashesRequests)
+	}
+
+	blockPool.Stop()
 
 }
