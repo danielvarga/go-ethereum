@@ -163,6 +163,8 @@ type ethProtocolTester struct {
 
 func newEth(t *testing.T) *ethProtocolTester {
 	return &ethProtocolTester{
+		quit:         make(chan error),
+		rw:           &testMsgReadWriter{in: make(chan p2p.Msg, 10)},
 		txPool:       &testTxPool{},
 		chainManager: &testChainManager{},
 		blockPool:    &testBlockPool{},
@@ -215,6 +217,11 @@ func (self *ethProtocolTester) checkMsg(i int, code uint64, val interface{}) (ms
 }
 
 func (self *ethProtocolTester) run() {
+	err := runEthProtocol(self.txPool, self.chainManager, self.blockPool, testPeer(), self.rw)
+	self.quit <- err
+}
+
+func (self *ethProtocolTester) reset() {
 	self.quit = make(chan error)
 	self.rw = &testMsgReadWriter{in: make(chan p2p.Msg, 10)}
 	err := runEthProtocol(self.txPool, self.chainManager, self.blockPool, testPeer(), self.rw)
