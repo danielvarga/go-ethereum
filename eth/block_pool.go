@@ -143,6 +143,7 @@ func (self *BlockPool) AddPeer(td *big.Int, currentBlock []byte, peerId string, 
 		requestBlockHashes: requestBlockHashes,
 		requestBlocks:      requestBlocks,
 		peerError:          peerError,
+		sections:           make(map[string]*section),
 	}
 	self.peers[peerId] = peer
 	poolLogger.Debugf("add new peer %v with td %v", peerId, td)
@@ -729,12 +730,19 @@ func (self *peerInfo) controlSections(peer *peerInfo, on bool) {
 		peer.lock.RLock()
 		defer peer.lock.RUnlock()
 	}
-	for hash, section := range peer.sections {
+	for hash, section := range self.sections {
 		if section.done() {
 			delete(self.sections, hash)
+			continue
 		}
-		_, exists := peer.sections[hash]
-		if on || peer == nil || exists {
+		var found bool
+		if peer != nil {
+			_, found = peer.sections[hash]
+		}
+
+		// switch on processes not found in old peer
+		// and switch off processes not found in new peer
+		if !found {
 			if on {
 				// self is best peer
 				section.start()
