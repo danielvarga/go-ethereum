@@ -59,7 +59,19 @@ func (self *Header) RlpData() interface{} {
 }
 
 func (self *Header) Hash() []byte {
-	return crypto.Sha3(ethutil.Encode(self.rlpData(true)))
+	if self.HeaderHash != nil {
+		return self.HeaderHash
+	} else {
+		return crypto.Sha3(ethutil.Encode(self.rlpData(true)))
+	}
+}
+
+func (self *Block) ParentHash() []byte {
+	if self.ParentHeaderHash != nil {
+		return self.ParentHeaderHash
+	} else {
+		return self.header.ParentHash
+	}
 }
 
 func (self *Header) HashNoNonce() []byte {
@@ -67,10 +79,13 @@ func (self *Header) HashNoNonce() []byte {
 }
 
 type Block struct {
-	header       *Header
-	uncles       []*Header
-	transactions Transactions
-	Td           *big.Int
+	// Preset Hashes for mocking
+	HeaderHash       []byte
+	ParentHeaderHash []byte
+	header           *Header
+	uncles           []*Header
+	transactions     Transactions
+	Td               *big.Int
 
 	receipts Receipts
 	Reward   *big.Int
@@ -189,7 +204,6 @@ func (self *Block) RlpDataForStorage() interface{} {
 // Header accessors (add as you need them)
 func (self *Block) Number() *big.Int          { return self.header.Number }
 func (self *Block) NumberU64() uint64         { return self.header.Number.Uint64() }
-func (self *Block) ParentHash() []byte        { return self.header.ParentHash }
 func (self *Block) Bloom() []byte             { return self.header.Bloom }
 func (self *Block) Coinbase() []byte          { return self.header.Coinbase }
 func (self *Block) Time() int64               { return int64(self.header.Time) }
