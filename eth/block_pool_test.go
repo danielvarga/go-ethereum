@@ -31,6 +31,7 @@ func (self *blockPoolTester) hasBlock(block []byte) (ok bool) {
 	indexes := self.hashPool.hashesToIndexes([][]byte{block})
 	i := indexes[0]
 	_, ok = self.blockChain[i]
+	fmt.Printf("has block %v (%x...): %v\n", i, block[0:4], ok)
 	return
 }
 
@@ -38,21 +39,25 @@ func (self *blockPoolTester) insertChain(blocks types.Blocks) error {
 	self.lock.RLock()
 	defer self.lock.RUnlock()
 	var parent, child int
-	var children []int
+	var children, refChildren []int
 	var ok bool
 	for _, block := range blocks {
 		child = self.hashPool.hashesToIndexes([][]byte{block.Hash()})[0]
 		_, ok = self.blockChain[child]
-		continue // already in chain
+		if ok {
+			fmt.Printf("block %v already in blockchain\n", child)
+			continue // already in chain
+		}
 		parent = self.hashPool.hashesToIndexes([][]byte{block.PrevHash})[0]
-		_, ok = self.blockChain[parent]
+		children, ok = self.blockChain[parent]
 		if !ok {
 			return fmt.Errorf("parent %v not in blockchain ", parent)
 		}
-		children, ok = self.refBlockChain[parent]
-		if ok {
-			ok = false
-			for _, c := range children {
+		ok = false
+		var found bool
+		refChildren, found = self.refBlockChain[parent]
+		if found {
+			for _, c := range refChildren {
 				if c == child {
 					ok = true
 				}
@@ -61,10 +66,14 @@ func (self *blockPoolTester) insertChain(blocks types.Blocks) error {
 				return fmt.Errorf("invalid block %v", child)
 			}
 		} else {
-			// accept any blocks if parent not in refBlockChain
-			self.blockChain[parent] = append(children, child)
+			ok = true
 		}
-		self.blockChain[child] = nil
+		if ok {
+			// accept any blocks if parent not in refBlockChain
+			fmt.Errorf("blockchain insert %v -> %v\n", parent, child)
+			self.blockChain[parent] = append(children, child)
+			self.blockChain[child] = nil
+		}
 	}
 	return nil
 }
@@ -149,6 +158,7 @@ type peerTester struct {
 	blockHashesRequests []int
 	blocksRequests      [][]int
 	peerErrors          []int
+	blockPool           blockPool
 	hashPool            *testHashPool
 	lock                sync.Mutex
 	id                  string
@@ -156,9 +166,30 @@ type peerTester struct {
 	currentBlock        int
 }
 
-func (self *peerTester) AddPeer(blockPool blockPool) bool {
+func (self *peerTester) AddPeer() bool {
 	hash := self.hashPool.indexesToHashes([]int{self.currentBlock})[0]
-	return blockPool.AddPeer(self.td, hash, self.id, self.requestBlockHashes, self.requestBlocks, self.peerError)
+	return self.blockPool.AddPeer(self.td, hash, self.id, self.requestBlockHashes, self.requestBlocks, self.peerError)
+}
+
+func (self *peerTester) AddBlockHashes(indexes []int) {
+	i := 0
+	hashes := self.hashPool.indexesToHashes(indexes)
+	next := func() (hash []byte, ok bool) {
+		if i < len(hashes) {
+			hash = hashes[i]
+			ok = true
+			i++
+		}
+		return
+	}
+	self.blockPool.AddBlockHashes(next, self.id)
+}
+
+func (self *peerTester) AddBlocks(indexes ...int) {
+	hashes := self.hashPool.indexesToHashes(indexes)
+	for i := 1; i < len(hashes); i++ {
+		self.blockPool.AddBlock(&types.Block{HeaderHash: ethutil.Bytes(hashes[i]), PrevHash: ethutil.Bytes(hashes[i-1])}, self.id)
+	}
 }
 
 // peer callbacks are simply recording the hash and blockrequests with indexes
@@ -204,21 +235,24 @@ func TestAddPeer(t *testing.T) {
 		td:           ethutil.Big1,
 		currentBlock: 0,
 		hashPool:     hashPool,
+		blockPool:    blockPool,
 	}
 	peer1 := &peerTester{
 		id:           "peer1",
 		td:           ethutil.Big2,
 		currentBlock: 1,
 		hashPool:     hashPool,
+		blockPool:    blockPool,
 	}
 	peer2 := &peerTester{
 		id:           "peer2",
 		td:           ethutil.Big3,
 		currentBlock: 2,
 		hashPool:     hashPool,
+		blockPool:    blockPool,
 	}
 	blockPool.Start()
-	best := peer0.AddPeer(blockPool)
+	best := peer0.AddPeer()
 	if !best {
 		t.Errorf("peer0 (TD=1) not accepted as best")
 	}
@@ -227,7 +261,7 @@ func TestAddPeer(t *testing.T) {
 		t.Errorf("peer0 (TD=1) not set as best")
 	}
 
-	best = peer2.AddPeer(blockPool)
+	best = peer2.AddPeer()
 	if !best {
 		t.Errorf("peer2 (TD=3) not accepted as best")
 	}
@@ -236,7 +270,7 @@ func TestAddPeer(t *testing.T) {
 		t.Errorf("peer2 (TD=3) not set as best")
 	}
 
-	best = peer1.AddPeer(blockPool)
+	best = peer1.AddPeer()
 	if best {
 		t.Errorf("peer1 (TD=2) accepted as best")
 	}
@@ -275,7 +309,7 @@ func TestAddPeer(t *testing.T) {
 
 	// adding back earlier peer ok
 	peer0.currentBlock = 3
-	best = peer0.AddPeer(blockPool)
+	best = peer0.AddPeer()
 	if !best {
 		t.Errorf("peer0 (TD=1) not accepted as best")
 	}
@@ -305,7 +339,7 @@ func TestAddPeer(t *testing.T) {
 
 }
 
-func TestSimpleChain(t *testing.T) {
+func TestPeerWithKnownBlock(t *testing.T) {
 	logger.AddLogSystem(logsys)
 	hashPool, blockPool, blockPoolTester := newTestBlockPool(t)
 	blockPoolTester.refBlockChain[0] = nil
@@ -318,13 +352,63 @@ func TestSimpleChain(t *testing.T) {
 		td:           ethutil.Big1,
 		currentBlock: 0,
 		hashPool:     hashPool,
+		blockPool:    blockPool,
 	}
-	peer0.AddPeer(blockPool)
+	peer0.AddPeer()
+	blockPool.Stop()
 	// no request on known block
 	if len(peer0.blockHashesRequests) != 0 {
 		t.Errorf("incorrect hash requests for peer0: %v", peer0.blockHashesRequests)
 	}
+}
+
+const cycleWait = 10
+
+func TestSimpleChain(t *testing.T) {
+	logger.AddLogSystem(logsys)
+	hashPool, blockPool, blockPoolTester := newTestBlockPool(t)
+	blockPoolTester.blockChain[0] = nil
+	for k, v := range blockPoolTester.blockChain {
+		fmt.Printf("%v -> %v", k, v)
+	}
+	blockPoolTester.refBlockChain[0] = []int{1}
+	blockPoolTester.refBlockChain[1] = []int{2}
+	// hashPool, blockPool, blockPoolTester := newTestBlockPool()
+	blockPool.Start()
+
+	peer1 := &peerTester{
+		id:           "peer1",
+		td:           ethutil.Big1,
+		currentBlock: 2,
+		hashPool:     hashPool,
+		blockPool:    blockPool,
+	}
+	peer1.AddPeer()
+	// no request on known block
+	if len(peer1.blockHashesRequests) != 1 ||
+		peer1.blockHashesRequests[0] != 2 {
+		t.Errorf("incorrect hash requests for peer1: %v", peer1.blockHashesRequests)
+	}
+	peer1.AddBlockHashes([]int{2, 1, 0})
+	blockPool.cycle(cycleWait)
+	blockPool.cycle(cycleWait)
+	if len(peer1.blocksRequests) == 0 ||
+		len(peer1.blocksRequests[0]) != 2 ||
+		peer1.blocksRequests[0][0] != 1 ||
+		peer1.blocksRequests[0][1] != 2 {
+		t.Errorf("incorrect block requests for peer1: %v", peer1.blocksRequests)
+	}
+	peer1.AddBlocks(0, 1, 2)
+	blockPool.cycle(cycleWait)
+	if len(blockPoolTester.blockChain[0]) != 1 ||
+		blockPoolTester.blockChain[0][0] != 1 ||
+		len(blockPoolTester.blockChain[1]) != 1 ||
+		blockPoolTester.blockChain[1][0] != 2 {
+		t.Errorf("incorrect blockchain")
+	}
+	for k, v := range blockPoolTester.blockChain {
+		fmt.Printf("%v -> %v", k, v)
+	}
 
 	blockPool.Stop()
-
 }
