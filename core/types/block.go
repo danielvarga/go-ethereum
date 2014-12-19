@@ -68,6 +68,8 @@ func (self blockSorter) Less(i, j int) bool { return self.by(self.blocks[i], sel
 func Number(b1, b2 *Block) bool { return b1.Number.Cmp(b2.Number) < 0 }
 
 type Block struct {
+	// Hash of this block
+	HeaderHash ethutil.Bytes
 	// Hash to the previous block
 	PrevHash ethutil.Bytes
 	// Uncles of this block
@@ -143,7 +145,11 @@ func CreateBlock(root interface{},
 
 // Returns a hash of the block
 func (block *Block) Hash() ethutil.Bytes {
-	return crypto.Sha3(ethutil.NewValue(block.header()).Encode())
+	if len(block.HeaderHash) == 0 {
+		return crypto.Sha3(ethutil.NewValue(block.header()).Encode())
+	} else {
+		return block.HeaderHash
+	}
 	//return crypto.Sha3(block.Value().Encode())
 }
 
