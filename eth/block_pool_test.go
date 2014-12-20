@@ -105,6 +105,12 @@ func arrayEq(a, b []int) bool {
 }
 
 func (self *blockPoolTester) checkBlockChain(blockChain map[int][]int) {
+	for k, v := range self.blockChain {
+		fmt.Printf("got: %v -> %v\n", k, v)
+	}
+	for k, v := range blockChain {
+		fmt.Printf("expected: %v -> %v\n", k, v)
+	}
 	if len(blockChain) != len(self.blockChain) {
 		self.t.Errorf("blockchain incorrect (length differ)")
 	}
@@ -114,11 +120,12 @@ func (self *blockPoolTester) checkBlockChain(blockChain map[int][]int) {
 			self.t.Errorf("blockchain incorrect on %v -> %v (!= %v)", k, vv, v)
 		}
 	}
+
 }
 
 func (self *peerTester) checkBlocksRequests(blocksRequests ...[]int) {
-	if len(blocksRequests) != len(self.blocksRequests) {
-		self.t.Errorf("blocks requests incorrect (length differ)\ngot %v\nexpected", blocksRequests, self.blocksRequests)
+	if len(blocksRequests) > len(self.blocksRequests) {
+		self.t.Errorf("blocks requests incorrect (length differ)\ngot %v\nexpected %v", blocksRequests, self.blocksRequests)
 	}
 	for i, r := range blocksRequests {
 		rr := self.blocksRequests[i]
@@ -352,75 +359,42 @@ func TestAddPeer(t *testing.T) {
 
 func TestPeerWithKnownBlock(t *testing.T) {
 	logger.AddLogSystem(logsys)
-	hashPool, blockPool, blockPoolTester := newTestBlockPool(t)
+	_, blockPool, blockPoolTester := newTestBlockPool(t)
 	blockPoolTester.refBlockChain[0] = nil
 	blockPoolTester.blockChain[0] = nil
 	// hashPool, blockPool, blockPoolTester := newTestBlockPool()
 	blockPool.Start()
 
-	peer0 := &peerTester{
-		id:           "peer0",
-		td:           ethutil.Big1,
-		currentBlock: 0,
-		hashPool:     hashPool,
-		blockPool:    blockPool,
-	}
+	peer0 := blockPoolTester.newPeer("0", 1, 0)
 	peer0.AddPeer()
 	blockPool.Stop()
 	// no request on known block
-	if len(peer0.blockHashesRequests) != 0 {
-		t.Errorf("incorrect hash requests for peer0: %v", peer0.blockHashesRequests)
-	}
+	peer0.checkBlockHashesRequests()
 }
 
 const cycleWait = 10
 
 func TestSimpleChain(t *testing.T) {
 	logger.AddLogSystem(logsys)
-	hashPool, blockPool, blockPoolTester := newTestBlockPool(t)
+	_, blockPool, blockPoolTester := newTestBlockPool(t)
 	blockPoolTester.blockChain[0] = nil
 	for k, v := range blockPoolTester.blockChain {
 		fmt.Printf("%v -> %v", k, v)
 	}
 	blockPoolTester.refBlockChain[0] = []int{1}
 	blockPoolTester.refBlockChain[1] = []int{2}
-	// hashPool, blockPool, blockPoolTester := newTestBlockPool()
 	blockPool.Start()
 
-	peer1 := &peerTester{
-		id:           "peer1",
-		td:           ethutil.Big1,
-		currentBlock: 2,
-		hashPool:     hashPool,
-		blockPool:    blockPool,
-	}
-
+	peer1 := blockPoolTester.newPeer("peer1", 1, 2)
 	peer1.AddPeer()
-	// no request on known block
-	if len(peer1.blockHashesRequests) != 1 ||
-		peer1.blockHashesRequests[0] != 2 {
-		t.Errorf("incorrect hash requests for peer1: %v", peer1.blockHashesRequests)
-	}
+	peer1.checkBlockHashesRequests(2)
 	peer1.AddBlockHashes([]int{2, 1, 0})
 	blockPool.cycle(cycleWait)
 	blockPool.cycle(cycleWait)
-	if len(peer1.blocksRequests) == 0 ||
-		len(peer1.blocksRequests[0]) != 2 ||
-		peer1.blocksRequests[0][0] != 1 ||
-		peer1.blocksRequests[0][1] != 2 {
-		t.Errorf("incorrect block requests for peer1: %v", peer1.blocksRequests)
-	}
+	peer1.checkBlocksRequests([]int{1, 2})
 	peer1.AddBlocks(0, 1, 2)
 	blockPool.cycle(cycleWait)
-	if len(blockPoolTester.blockChain[0]) != 1 ||
-		blockPoolTester.blockChain[0][0] != 1 ||
-		len(blockPoolTester.blockChain[1]) != 1 ||
-		blockPoolTester.blockChain[1][0] != 2 {
-		t.Errorf("incorrect blockchain")
-	}
-	for k, v := range blockPoolTester.blockChain {
-		fmt.Printf("%v -> %v", k, v)
-	}
-
+	blockPoolTester.refBlockChain[2] = []int{}
+	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
 	blockPool.Stop()
 }
