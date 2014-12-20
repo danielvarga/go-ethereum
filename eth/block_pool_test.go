@@ -22,6 +22,7 @@ type blockPoolTester struct {
 	lock          sync.RWMutex
 	refBlockChain map[int][]int
 	blockChain    map[int][]int
+	blockPool     *BlockPool
 	t             *testing.T
 }
 
@@ -104,11 +105,48 @@ func arrayEq(a, b []int) bool {
 }
 
 func (self *blockPoolTester) checkBlockChain(blockChain map[int][]int) {
+	if len(blockChain) != len(self.blockChain) {
+		self.t.Errorf("blockchain incorrect (length differ)")
+	}
 	for k, v := range blockChain {
 		vv, ok := self.blockChain[k]
 		if !ok || !arrayEq(v, vv) {
 			self.t.Errorf("blockchain incorrect on %v -> %v (!= %v)", k, vv, v)
 		}
+	}
+}
+
+func (self *peerTester) checkBlocksRequests(blocksRequests ...[]int) {
+	if len(blocksRequests) != len(self.blocksRequests) {
+		self.t.Errorf("blocks requests incorrect (length differ)\ngot %v\nexpected", blocksRequests, self.blocksRequests)
+	}
+	for i, r := range blocksRequests {
+		rr := self.blocksRequests[i]
+		if !arrayEq(r, rr) {
+			self.t.Errorf("blocks requests incorrect\ngot %v\nexpected", r, rr)
+		}
+	}
+}
+
+func (self *peerTester) checkBlockHashesRequests(blocksHashesRequests ...int) {
+	r := blocksHashesRequests
+	rr := self.blockHashesRequests
+	if len(r) != len(rr) {
+		self.t.Errorf("block hashes requests incorrect (length differ)\ngot %v\nexpected", r, rr)
+	}
+	if !arrayEq(r, rr) {
+		self.t.Errorf("block hashes requests incorrect\ngot %v\nexpected", r, rr)
+	}
+}
+
+func (self *blockPoolTester) newPeer(id string, td int, cb int) *peerTester {
+	return &peerTester{
+		id:           id,
+		td:           big.NewInt(int64(td)),
+		currentBlock: cb,
+		hashPool:     self.hashPool,
+		blockPool:    self.blockPool,
+		t:            self.t,
 	}
 }
 
@@ -164,6 +202,7 @@ type peerTester struct {
 	id                  string
 	td                  *big.Int
 	currentBlock        int
+	t                   *testing.T
 }
 
 func (self *peerTester) AddPeer() bool {
@@ -222,35 +261,17 @@ func newTestBlockPool(t *testing.T) (hashPool *testHashPool, blockPool *BlockPoo
 		blockChain:    make(map[int][]int),
 		refBlockChain: make(map[int][]int),
 	}
-	blockPool = NewBlockPool(b.hasBlock, b.insertChain, b.verifyPoW)
+	b.blockPool = NewBlockPool(b.hasBlock, b.insertChain, b.verifyPoW)
+	blockPool = b.blockPool
 	return
 }
 
 func TestAddPeer(t *testing.T) {
 	logger.AddLogSystem(logsys)
-	hashPool, blockPool, _ := newTestBlockPool(t)
-	// hashPool, blockPool, blockPoolTester := newTestBlockPool()
-	peer0 := &peerTester{
-		id:           "peer0",
-		td:           ethutil.Big1,
-		currentBlock: 0,
-		hashPool:     hashPool,
-		blockPool:    blockPool,
-	}
-	peer1 := &peerTester{
-		id:           "peer1",
-		td:           ethutil.Big2,
-		currentBlock: 1,
-		hashPool:     hashPool,
-		blockPool:    blockPool,
-	}
-	peer2 := &peerTester{
-		id:           "peer2",
-		td:           ethutil.Big3,
-		currentBlock: 2,
-		hashPool:     hashPool,
-		blockPool:    blockPool,
-	}
+	_, blockPool, blockPoolTester := newTestBlockPool(t)
+	peer0 := blockPoolTester.newPeer("peer0", 1, 0)
+	peer1 := blockPoolTester.newPeer("peer1", 2, 1)
+	peer2 := blockPoolTester.newPeer("peer2", 3, 2)
 	blockPool.Start()
 	best := peer0.AddPeer()
 	if !best {
@@ -319,22 +340,12 @@ func TestAddPeer(t *testing.T) {
 		t.Errorf("peer0 (TD=1) not set as best")
 	}
 
-	if len(peer0.blockHashesRequests) != 3 ||
-		peer0.blockHashesRequests[0] != 0 || // on first connect
-		peer0.blockHashesRequests[1] != 0 || // after fallback
-		peer0.blockHashesRequests[2] != 3 { // after 2nd connect
-		t.Errorf("incorrect hash requests for peer0: %v", peer0.blockHashesRequests)
-	}
+	peer0.checkBlockHashesRequests(0, 0, 3)
 
-	if len(peer1.blockHashesRequests) != 1 ||
-		peer1.blockHashesRequests[0] != 1 {
-		t.Errorf("incorrect hash requests for peer1 : %v", peer1.blockHashesRequests)
-	}
+	peer1.checkBlockHashesRequests(1)
 
-	if len(peer2.blockHashesRequests) != 1 ||
-		peer2.blockHashesRequests[0] != 2 {
-		t.Errorf("incorrect hash requests  for peer2: %v", peer2.blockHashesRequests)
-	}
+	peer2.checkBlockHashesRequests(2)
+
 	blockPool.Stop()
 
 }
@@ -383,6 +394,7 @@ func TestSimpleChain(t *testing.T) {
 		hashPool:     hashPool,
 		blockPool:    blockPool,
 	}
+
 	peer1.AddPeer()
 	// no request on known block
 	if len(peer1.blockHashesRequests) != 1 ||

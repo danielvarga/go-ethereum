@@ -214,6 +214,7 @@ func (self *BlockPool) cycle(t time.Duration) (ok bool) {
 // the status message has been received with total difficulty and current block hash
 // AddPeer can only be used once, RemovePeer needs to be called when the peer disconnects
 func (self *BlockPool) AddPeer(td *big.Int, currentBlock []byte, peerId string, requestBlockHashes func([]byte) error, requestBlocks func([][]byte) error, peerError func(int, string, ...interface{})) bool {
+
 	self.peersLock.Lock()
 	defer self.peersLock.Unlock()
 	if self.peers[peerId] != nil {
