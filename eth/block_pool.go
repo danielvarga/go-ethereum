@@ -1,6 +1,7 @@
 package eth
 
 import (
+	"fmt"
 	"math"
 	"math/big"
 	"math/rand"
@@ -19,9 +20,9 @@ var poolLogger = logger.NewLogger("Blockpool")
 const (
 	blockHashesBatchSize       = 256
 	blockBatchSize             = 64
-	blocksRequestInterval      = 10 // seconds
+	blocksRequestInterval      = 100 // ms
 	blocksRequestRepetition    = 1
-	blockHashesRequestInterval = 10 // seconds
+	blockHashesRequestInterval = 100 // ms
 	blocksRequestMaxIdleRounds = 10
 	cacheTimeout               = 3 // minutes
 	blockTimeout               = 5 // minutes
@@ -35,6 +36,7 @@ type poolNode struct {
 	child       *poolNode
 	parent      *poolNode
 	section     *section
+	complete    bool
 	knownParent bool
 	peer        string
 	source      string
@@ -54,12 +56,8 @@ type BlockPool struct {
 	wg      sync.WaitGroup
 	running bool
 
-	cycleGLock  sync.Mutex
-	cycleLock   sync.RWMutex
-	cycleC      chan chan bool
-	cycleN      int
-	cycleWaiter chan bool
-	cycleWG     sync.WaitGroup
+	blocksRequestCycle      *cycle
+	blockHashesRequestCycle *cycle
 
 	// the minimal interface with blockchain
 	hasBlock    func(hash []byte) bool
@@ -102,8 +100,8 @@ func (self *BlockPool) Start() {
 	self.running = true
 	self.quit = make(chan bool)
 	self.flushC = make(chan bool)
-	self.cycleWaiter = make(chan bool)
-	self.cycleC = make(chan chan bool)
+	self.blocksRequestCycle = &cycle{c: make(chan bool), w: make(chan bool)}
+	self.blockHashesRequestCycle = &cycle{c: make(chan bool), w: make(chan bool)}
 	self.pool = make(map[string]*poolNode)
 	self.lock.Unlock()
 
@@ -127,87 +125,84 @@ func (self *BlockPool) Stop() {
 	poolLogger.Infoln("Stopping")
 
 	close(self.quit)
-	self.lock.Lock()
+	self.wg.Wait()
+
 	self.peersLock.Lock()
 	self.peers = nil
-	self.pool = nil
 	self.peer = nil
-	self.wg.Wait()
-	self.lock.Unlock()
 	self.peersLock.Unlock()
-	poolLogger.Infoln("Stopped")
 
+	self.lock.Lock()
+	self.pool = nil
+	self.lock.Unlock()
+
+	poolLogger.Infoln("Stopped")
 }
 
-func (self *BlockPool) flush() {
+func (self *BlockPool) Flush() {
 	self.lock.Lock()
 	if !self.running {
 		self.lock.Unlock()
 		return
 	}
-
-	poolLogger.Infoln("Waiting")
 	self.lock.Unlock()
+
+	poolLogger.Infoln("Flushing")
 	close(self.flushC)
-	self.flushC = make(chan bool)
 	self.wg.Wait()
+
+	self.flushC = make(chan bool)
 
 	poolLogger.Infoln("Stopped")
 
+}
+
+func (self *BlockPool) HashCycle(t time.Duration) (bool, error) {
+	return self.Cycle(self.blockHashesRequestCycle, t)
+}
+
+func (self *BlockPool) BlockCycle(t time.Duration) (bool, error) {
+	return self.Cycle(self.blocksRequestCycle, t)
+}
+
+func (self *BlockPool) Wait(t time.Duration) {
+	for i := 0; i < 10; i++ {
+		hok, _ := self.HashCycle(t)
+		bok, _ := self.BlockCycle(t)
+		if !hok && !bok {
+			return
+		}
+	}
 }
 
 // signal used in testing to trigger and wait until
 // at least one cycle of iteration through the chain section is complete
 // returns true if at least one process finishes a cycle
 // returns false if no processes picked up on the signal within t seconds
-func (self *BlockPool) cycle(t time.Duration) (ok bool) {
+func (self *BlockPool) Cycle(cycle *cycle, t time.Duration) (ok bool, err error) {
 	// ignore if pool not running
 	self.lock.Lock()
 	if !self.running {
 		self.lock.Unlock()
-		return false
+		return false, nil
 	}
 	self.lock.Unlock()
 
-	// global cycle lock so that cycle waits cannot be concurrent
-	// 	self.cycleGLock.Lock()
-	// defer self.cycleGLock.Unlock()
-	// lock not needed since it all writes run in a single process?
-	cycleC := self.cycleC
-	cycleWaiter := self.cycleWaiter
-	cycleN := self.cycleN
-	self.cycleLock.Lock()
-	self.cycleC = make(chan chan bool)
-	self.cycleWaiter = make(chan bool)
-	self.cycleN++
-	self.cycleLock.Unlock()
+	poolLogger.Debugf("wait one cycle")
 
-	poolLogger.Debugf("signal cycle %v", cycleN)
-
-	waiter := make(chan bool)
-	poolLogger.Debugf("waiting %v", cycleN)
+	wait := make(chan bool)
 	go func() {
-		self.wg.Wait()
-		<-cycleC
-		close(waiter)
+		wait <- cycle.wait()
 	}()
 
-	cycleC <- waiter
-
 	select {
-	case _, ok := <-waiter:
-		if ok {
-			poolLogger.Debugf("first process received signal %v", cycleN)
-			self.cycleWG.Wait()
-		} else {
-			poolLogger.Debugf("no processes %v", cycleN)
-		}
-		poolLogger.Debugf("cycle %v complete", cycleN)
-	case <-time.After(t * time.Second):
-		poolLogger.Debugf("no processes picked up %v", cycleN)
+	case ok := <-wait:
+		poolLogger.Debugf("cycle ok = %v", ok)
+		return ok, nil
+	case <-time.After(t):
+		return false, fmt.Errorf("timeout")
 	}
-	close(cycleWaiter)
-	return
+
 }
 
 // AddPeer is called by the eth protocol instance running on the peer after
@@ -319,13 +314,13 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 	}
 	// peer is still the best
 	poolLogger.Debugf("adding hashes for best peer %s", peerId)
-	self.cycleLock.Lock()
-	cycleWaiter := self.cycleWaiter
-	cycleC := self.cycleC
-	self.cycleLock.Unlock()
-
-	// iterate using next (rlp stream lazy decoder) feeding hashesC
+	var blockHashesRequestCycle bool
+	if self.blockHashesRequestCycle != nil {
+		self.blockHashesRequestCycle.start()
+		blockHashesRequestCycle = true
+	}
 	self.wg.Add(1)
+
 	go func() {
 		var child *poolNode
 		var depth int
@@ -341,19 +336,23 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 				// if the peer is demoted, no more hashes taken
 				break LOOP
 			default:
+				// iterate using next (rlp stream lazy decoder) feeding hashesC
 				hash, ok := next()
-				poolLogger.Debugf("[%x] depth %v", hash[:4], depth)
-
 				if firstHash == nil {
 					firstHash = hash
 				}
-				if ok && self.hasBlock(hash) {
-					// check if known block connecting the downloaded chain to our blockchain
-					poolLogger.Debugf("[%x] known block", hash[0:4])
-					ok = false
+				var knownParent bool
+				if ok {
+					poolLogger.Debugf("[%x] depth %v", hash[:4], depth)
+					if self.hasBlock(hash) {
+						// check if known block connecting the downloaded chain to our blockchain
+						poolLogger.Debugf("[%x] known block", hash[0:4])
+						knownParent = true
+						ok = false
+					}
 				}
 				if !ok {
-					if child != nil {
+					if child != nil && knownParent {
 						child.Lock()
 						// mark child as absolute pool root with parent known to blockchain
 						child.knownParent = true
@@ -375,6 +374,7 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 						parent.RLock()
 						if parent.parent == nil {
 							// the first block hash received is an orphan in the pool, so rejoice and continue
+							poolLogger.Debugf("[%x] found first hash", hash[:4])
 							depth++
 							child = parent
 							parent.RUnlock()
@@ -393,16 +393,21 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 					child: child,
 					peer:  peerId,
 				}
+				if child == nil {
+					panic("oops")
+				}
 				poolLogger.Debugf("[%x] -> orphan %x", hash[:4], child.hash[:4])
 				child.Lock()
-				if child.child == nil {
+				if depth > 1 || child.child == nil {
 					parent.section = child.section
+					poolLogger.Debugf("[%x] -> %x inherit section", hash[:4], child.hash[:4])
 				} else {
 					parent.section = &section{
 						controlC: make(chan bool),
 						resetC:   make(chan bool),
 						top:      parent,
 					}
+					poolLogger.Debugf("[%x] -> %x new	 section", hash[:4], child.hash[:4])
 				}
 				child.parent = parent
 				child.Unlock()
@@ -416,26 +421,78 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 		} //for
 
 		if child != nil {
-			poolLogger.Debugf("chain section of %v hashes added %x-%x by peer %s", depth, child.hash[0:4], firstHash[0:4], peerId)
+			poolLogger.Debugf("[%x]-[%x] chain section of %v hashes added by peer %s", child.hash[:4], firstHash[:4], depth, peerId)
 			// start a processSection on the last node, but switch off asking
 			// hashes and blocks until next peer confirms this chain
 			// or blocks are all received
-			self.cycleWG.Add(1)
-			waiter, ok := <-cycleC
-			if ok {
-				waiter <- true
-				close(cycleC)
-			}
+
 			self.processSection(child)
-			self.cycleWG.Done()
 			peer.addSection(child.hash, child.section)
 			child.section.start()
-
 		}
 		poolLogger.Debugf("done adding hashes for peer %s", peerId)
-		<-cycleWaiter
 		self.wg.Done()
+		if blockHashesRequestCycle {
+			poolLogger.Debugf("end hcycle on quit")
+			self.blockHashesRequestCycle.stop()
+		}
 	}()
+}
+
+type cycle struct {
+	i  int
+	c  chan bool
+	w  chan bool
+	wg sync.WaitGroup
+	l  sync.RWMutex
+	g  sync.Mutex
+	e  bool
+}
+
+func (self *cycle) wait() bool {
+	self.g.Lock()
+	defer self.g.Unlock()
+	self.l.RLock()
+	close(self.c)
+	self.l.RUnlock()
+	self.wg.Wait()
+	self.l.Lock()
+	defer self.l.Unlock()
+	self.i++
+	w := self.w
+	self.c = make(chan bool)
+	self.w = make(chan bool)
+	close(w)
+	if self.e {
+		return true
+	}
+	self.e = false
+	return false
+}
+
+func (self *cycle) start() {
+	self.wg.Add(1)
+	self.l.Lock()
+	defer self.l.Unlock()
+	self.e = true
+}
+
+func (self *cycle) stop() {
+	select {
+	case <-self.c: // safe read since self.c not written while stop is called
+		w := self.w
+		self.wg.Done()
+		// self.w is set here only
+		// self.c is set here only
+		<-w
+	default:
+		self.wg.Done()
+	}
+}
+
+func (self *cycle) restart() {
+	self.stop()
+	self.start()
 }
 
 // AddBlock is the entry point for the eth protocol when blockmsg is received upon requests
@@ -543,56 +600,64 @@ func (self *BlockPool) processSection(node *poolNode) {
 	resetC := node.section.resetC
 	node.sectionRUnlock()
 
-	self.cycleLock.RLock()
-	var nextCycleN int = self.cycleN
-	var nextCycleC chan chan bool = self.cycleC
-	var nextCycleWaiter chan bool = self.cycleWaiter
-	self.cycleLock.RUnlock()
-
 	self.wg.Add(1)
 	go func() {
 		// absolute time after which sub-chain is killed if not complete (some blocks are missing)
 		suicideTimer := time.After(blockTimeout * time.Minute)
+
 		var blocksRequestTimer, blockHashesRequestTimer <-chan time.Time
+		var blocksRequestTime, blockHashesRequestTime bool
+		var blocksRequestCycle, blockHashesRequestCycle bool
+		var blocksRequestCycles, blockHashesRequestCycles bool
+		var blocksRequests, blockHashesRequests int
+		var blocksRequestsComplete, blockHashesRequestsComplete bool
+
+		// node channels for the section
 		var missingC, processC, offC chan *poolNode
+		// container for missing block hashes
 		var hashes [][]byte
+
 		var i, total, missing, lastMissing, depth int
-		var blockHashesRequests, blocksRequests int
 		var idle int
-		var init, alarm, done, same, running, flush, cycle, cycleStarted, ready, newCycle bool
-		orignode := node
-		hash := node.hash
-		poolLogger.Debugf("[%x] start section process", hash[0:4])
-		var cycleC chan chan bool
-		var cycleWaiter chan bool
-		var cycleN int
-		newCycle = true
+		var init, done, same, running, flush, ready bool
+
+		hash := node.hash[:4]
+		poolLogger.Debugf("[%x] start section process", hash)
+
+		if self.blockHashesRequestCycle != nil {
+			poolLogger.Debugf("[%x] watching hash requests", hash[0:4])
+			blockHashesRequestCycles = true
+		}
+		if self.blocksRequestCycle != nil {
+			poolLogger.Debugf("[%x] watching block requests", hash[0:4])
+			blocksRequestCycles = true
+		}
+
+		blockHashesRequestRoot := node
 
 	LOOP:
 		for {
-
-			if newCycle && cycleC == nil && !cycle {
-				poolLogger.Debugf("[%x] cycle %v control set (current %v)", hash[0:4], nextCycleN, self.cycleN)
-				cycleN = nextCycleN
-				cycleC = nextCycleC
-				cycleWaiter = nextCycleWaiter
-				newCycle = false
-			}
-
-			// went through all blocks in section
+			if blockHashesRequestsComplete && blocksRequestsComplete {
+				// not waiting for hashes any more
+				poolLogger.Debugf("[%x] section complete %v blocks retrieved (%v attempts), hash requests complete on %x (%v attempts)", hash, depth, blocksRequests, blockHashesRequestRoot, blockHashesRequests)
+				break LOOP
+			} // otherwise suicide if no hashes coming
 			if done {
+				// went through all blocks in section
 				if missing == 0 {
 					// no missing blocks
 					poolLogger.Debugf("[%x] got all blocks. process complete (%v total blocksRequests): missing %v/%v/%v", hash[0:4], blocksRequests, missing, total, depth)
 					node.sectionLock()
 					node.section.complete = true
 					node.sectionUnlock()
+					blocksRequestsComplete = true
 					blocksRequestTimer = nil
-					if blockHashesRequestTimer == nil {
-						// not waiting for hashes any more
-						poolLogger.Debugf("[%x] block hash request (%v total attempts) not needed", hash[0:4], blockHashesRequests)
-						break LOOP
-					} // otherwise suicide if no hashes coming
+					if blocksRequestCycle {
+						poolLogger.Debugf("[%x] end blocksRequestCycle on completion", hash[0:4])
+						self.blocksRequestCycle.stop()
+						blocksRequestCycle = false
+						blocksRequestCycles = false
+					}
 				} else {
 					// some missing blocks
 					blocksRequests++
@@ -602,6 +667,7 @@ func (self *BlockPool) processSection(node *poolNode) {
 						self.requestBlocks(blocksRequests, hashes)
 						hashes = nil
 					}
+					poolLogger.Debugf("[%x] check if there is missing blocks", hash[:4])
 					if missing == lastMissing {
 						// idle round
 						if same {
@@ -609,7 +675,7 @@ func (self *BlockPool) processSection(node *poolNode) {
 							idle++
 							// too many idle rounds
 							if idle > blocksRequestMaxIdleRounds {
-								poolLogger.Debugf("[%x] block requests had %v idle rounds (%v total attempts): missing %v/%v/%v\ngiving up...", hash[0:4], idle, blocksRequests, missing, total, depth)
+								poolLogger.Debugf("[%x] block requests had %v idle rounds (%v total attempts): missing %v/%v/%v\ngiving up...", hash, idle, blocksRequests, missing, total, depth)
 								self.killChain(node, nil)
 								break LOOP
 							}
@@ -621,25 +687,12 @@ func (self *BlockPool) processSection(node *poolNode) {
 						same = false
 					}
 				}
+				poolLogger.Debugf("[%x] done checking missing blocks", hash)
+				if blocksRequestCycle {
+					self.blocksRequestCycle.restart()
+				}
 				if flush {
 					suicideTimer = time.After(0)
-				}
-				if cycle {
-					if cycleStarted {
-						poolLogger.Debugf("[%x] finish cycle", hash[0:4])
-						self.cycleWG.Done()
-						cycle = false
-						cycleStarted = false
-						alarm = true
-						go func() {
-							<-cycleWaiter
-							poolLogger.Debugf("[%x] new cycle", hash[0:4])
-							newCycle = true
-						}()
-					} else {
-						poolLogger.Debugf("[%x] start cycle", hash[0:4])
-						cycleStarted = true
-					}
 				}
 				lastMissing = missing
 				ready = true
@@ -649,130 +702,130 @@ func (self *BlockPool) processSection(node *poolNode) {
 				missingC = processC
 				// put processC offline
 				processC = nil
-				poolLogger.Debugf("[%x] ready for cycle %v", hash[0:4], blocksRequests)
+				poolLogger.Debugf("[%x] ready for cycle %v", hash, blocksRequests)
 			}
 			//
-			if ready && alarm {
-				poolLogger.Debugf("[%x] check if new blocks arrived (attempt %v): missing %v/%v/%v", hash[0:4], blocksRequests, missing, total, depth)
-				blocksRequestTimer = time.After(blocksRequestInterval * time.Second)
+			if ready && blocksRequestTime {
+				poolLogger.Debugf("[%x] check if new blocks arrived (attempt %v): missing %v/%v/%v", hash, blocksRequests, missing, total, depth)
+				blocksRequestTimer = time.After(blocksRequestInterval * time.Millisecond)
 				i = 0
 				missing = 0
-				alarm = false
+				blocksRequestTime = false
 				ready = false
-				// put back online
 				processC = offC
 			}
+			if blockHashesRequestTime {
+				blockHashesRequestRoot.RLock()
+				parent := blockHashesRequestRoot.parent
+				knownParent := blockHashesRequestRoot.knownParent
+				blockHashesRequestRoot.RUnlock()
+				if parent != nil || knownParent {
+					// if not root of chain, switch off
+					poolLogger.Debugf("[%x] parent found, hash requests deactivated (after %v total attempts)\n", hash, blockHashesRequests)
+					blockHashesRequestTimer = nil
+					blockHashesRequestsComplete = true
+					if blockHashesRequestCycle {
+						poolLogger.Debugf("[%x] end blockHashesRequestCycle on completion", hash[0:4])
+						self.blockHashesRequestCycle.stop()
+						blockHashesRequestCycle = false
+						blockHashesRequestCycles = false
+					}
+				} else {
+					blockHashesRequests++
+					poolLogger.Debugf("[%x] hash request on root (%v total attempts)\n", hash, blockHashesRequests)
+					self.requestBlockHashes(blockHashesRequestRoot.hash)
+					blockHashesRequestTimer = time.After(blockHashesRequestInterval * time.Millisecond)
+				}
+				if blockHashesRequestCycle {
+					self.blockHashesRequestCycle.restart()
+				}
+				blockHashesRequestTime = false
+			}
+
+			poolLogger.Debugf("[%x] select", hash)
 			select {
+
 			case <-self.quit:
 				break LOOP
 
 			case <-self.flushC:
 				flush = true
-				alarm = true
-
-			case waiter, ok := <-cycleC:
-				self.cycleWG.Add(1)
-				poolLogger.Debugf("[%x] cycle signal %v", hash[0:4], cycleN)
-				cycle = true
-				if ok {
-					waiter <- true
-					close(cycleC)
-				}
-				cycleC = nil
-				alarm = true
-				self.cycleLock.RLock()
-				nextCycleC = self.cycleC
-				nextCycleN = self.cycleN
-				nextCycleWaiter = self.cycleWaiter
-				self.cycleLock.RUnlock()
+				blocksRequestTime = true
 
 			case <-suicideTimer:
 				self.killChain(node, nil)
-				poolLogger.Warnf("[%x] timeout. (%v total attempts): missing %v/%v/%v", hash[0:4], blocksRequests, missing, total, depth)
+				poolLogger.Warnf("[%x] timeout. (%v total attempts): missing %v/%v/%v", hash, blocksRequests, missing, total, depth)
 				break LOOP
 
 			case <-blocksRequestTimer:
-				poolLogger.Debugf("[%x] block request time again", hash[0:4])
-				alarm = true
+				poolLogger.Debugf("[%x] block request time again", hash)
+				blocksRequestTime = true
 
 			case <-blockHashesRequestTimer:
-				poolLogger.Debugf("[%x] hash request time again", hash[0:4])
+				poolLogger.Debugf("[%x] hash request time again", hash)
+				blockHashesRequestTime = true
 
-				if orignode != nil {
-					orignode.RLock()
-					parent := orignode.parent
-					knownParent := orignode.knownParent
-					orignode.RUnlock()
-					if parent != nil && !knownParent {
-						// if not root of chain, switch off
-						poolLogger.Debugf("[%x] parent found, hash requests deactivated (after %v total attempts)\n", hash[0:4], blockHashesRequests)
-						blockHashesRequestTimer = nil
-					} else {
-						blockHashesRequests++
-						poolLogger.Debugf("[%x] hash request on root (%v total attempts)\n", hash[0:4], blockHashesRequests)
-						self.requestBlockHashes(parent.hash)
-						blockHashesRequestTimer = time.After(blockHashesRequestInterval * time.Second)
-					}
-				}
 			case r, ok := <-controlC:
 				if !ok {
 					break LOOP
 				}
 				if running && !r {
-					poolLogger.Debugf("[%x] idle mode", hash[0:4])
+					poolLogger.Debugf("[%x] idle mode", hash)
 					if init {
-						poolLogger.Debugf("[%x] off (%v total attempts): missing %v/%v/%v", hash[0:4], blocksRequests, missing, total, depth)
+						poolLogger.Debugf("[%x] off (%v total attempts): missing %v/%v/%v", hash, blocksRequests, missing, total, depth)
 					}
+
 					running = false
-					alarm = false
+					blocksRequestTime = false
 					blocksRequestTimer = nil
+					blockHashesRequestTime = false
 					blockHashesRequestTimer = nil
 					offC = processC
 					processC = nil
-					if cycle && cycleStarted {
-						poolLogger.Debugf("[%x] finish cycle on going idle %v", hash[0:4], cycleN)
-						self.cycleWG.Done()
-						cycle = false
-						cycleStarted = false
-						go func() {
-							<-cycleWaiter
-							newCycle = true
-						}()
+
+					if blocksRequestCycle {
+						poolLogger.Debugf("[%x] blocksRequestCycle off", hash)
+						self.blocksRequestCycle.stop()
+						blocksRequestCycle = false
+					}
+					if blockHashesRequestCycle {
+						poolLogger.Debugf("[%x] blockHashesRequestCycle off", hash)
+						self.blockHashesRequestCycle.stop()
+						blockHashesRequestCycle = false
 					}
 				}
 				if !running && r {
 					running = true
-					poolLogger.Debugf("[%x] active mode", hash[0:4])
-					node.sectionRLock()
-					poolLogger.Debugf("[%x] check if complete", hash[0:4])
-					complete := orignode.section.complete
-					node.sectionRUnlock()
-					if !complete {
-						poolLogger.Debugf("[%x] activate block requests", hash[0:4])
-						blocksRequestTimer = time.After(0)
-					}
-					orignode.RLock()
-					parent := orignode.parent
-					knownParent := orignode.knownParent
-					orignode.RUnlock()
 
-					if parent == nil && !knownParent {
-						// if no parent but not connected to blockchain
-						poolLogger.Debugf("[%x] activate block hashes requests", hash[0:4])
-						blockHashesRequestTimer = time.After(0)
-					} else {
-						blockHashesRequestTimer = nil
+					poolLogger.Debugf("[%x] active mode", hash)
+					poolLogger.Debugf("[%x] check if complete", hash)
+					if !blocksRequestsComplete {
+						if blocksRequestCycles {
+							poolLogger.Debugf("[%x] blocksRequestCycle on", hash)
+							self.blocksRequestCycle.start()
+							blocksRequestCycle = true
+						}
+						poolLogger.Debugf("[%x] activate block requests", hash)
+						blocksRequestTime = true
+					}
+					if !blockHashesRequestsComplete {
+						if blockHashesRequestCycles {
+							poolLogger.Debugf("[%x] blockHashesRequestCycle on", hash)
+							self.blockHashesRequestCycle.start()
+							blockHashesRequestCycle = true
+						}
+						poolLogger.Debugf("[%x] activate block hashes requests", hash)
+						blockHashesRequestTime = true
 					}
 					if !init {
 						// if not run at least once fully, launch iterator
 						processC = make(chan *poolNode, blockHashesBatchSize)
 						missingC = make(chan *poolNode, blockHashesBatchSize)
-						self.foldUp(orignode, processC)
+						self.foldUp(blockHashesRequestRoot, processC)
 						i = 0
 						total = 0
 						lastMissing = 0
 					} else {
-						alarm = true
 						processC = offC
 					}
 				}
@@ -795,10 +848,10 @@ func (self *BlockPool) processSection(node *poolNode) {
 					if depth == 0 {
 						break LOOP
 					}
-					poolLogger.Debugf("[%x] section initalised missing %v/%v/%v", hash[0:4], missing, total, depth)
+					poolLogger.Debugf("[%x] section initalised: missing %v/%v/%v", hash, missing, total, depth)
 					continue LOOP
 				}
-				poolLogger.Debugf("[%x] process node %v [%x]", hash[0:4], i, node.hash[0:4])
+				poolLogger.Debugf("[%x] process node %v [%x]", hash, i, node.hash[:4])
 				i++
 				// if node has no block
 				node.RLock()
@@ -807,30 +860,44 @@ func (self *BlockPool) processSection(node *poolNode) {
 				knownParent := node.knownParent
 				node.RUnlock()
 				if block == nil {
-					poolLogger.Debugf("[%x] block missing on [%x]", hash[0:4], node.hash[0:4])
+					poolLogger.Debugf("[%x] block missing on [%x]", hash, node.hash[:4])
 					missing++
 					hashes = append(hashes, nhash)
 					if len(hashes) == blockBatchSize {
-						poolLogger.Debugf("[%x] request %v missing blocks", hash[0:4], len(hashes))
+						poolLogger.Debugf("[%x] request %v missing blocks", hash, len(hashes))
 						self.requestBlocks(blocksRequests, hashes)
 						hashes = nil
 					}
 					missingC <- node
 				} else {
 					// block is found
+					node.Lock()
+					// node is marked as complete so that it can be inserted in the block chain
+					// if only node.block != nil was checked, the node could still be in the missingC channel
+					node.complete = true
+					node.Unlock()
 					if knownParent {
 						// connected to the blockchain, insert the longest chain of blocks
 						var blocks types.Blocks
 						child := node
-						parent := node
-						node.sectionRLock()
-						for child != nil && child.block != nil {
-							parent = child
-							blocks = append(blocks, parent.block)
-							child = parent.child
+						// iterate up along complete nodes potentially across multiple sections
+						for child != nil {
+							child.Lock()
+							if child.section == node.section && child.block != nil {
+								child.complete = true
+							}
+							if !child.complete {
+								// mark the next one (no block yet) as connected to blockchain
+								child.knownParent = true
+								child.Unlock()
+								break
+							}
+							blocks = append(blocks, child.block)
+							next := child.child
+							child.Unlock()
+							child = next
 						}
-						node.sectionRUnlock()
-						poolLogger.Debugf("[%x] insert %v blocks into blockchain", hash[0:4], len(blocks))
+						poolLogger.Debugf("[%x] insert %v blocks into blockchain", hash, len(blocks))
 						if err := self.insertChain(blocks); err != nil {
 							// TODO: not clear which peer we need to address
 							// peerError should dispatch to peer if still connected and disconnect
@@ -844,38 +911,40 @@ func (self *BlockPool) processSection(node *poolNode) {
 						}
 						// pop the inserted ancestors off the channel
 						for j := 1; j < len(blocks); j++ {
-							i++
-							<-processC
-						}
-						if child != nil {
-							child.Lock()
-							// mark the next one (no block yet) as connected to blockchain
-							child.knownParent = true
-							child.Unlock()
-							// reset starting node to first node with missing block
-							orignode = child
+							select {
+							case <-processC:
+								i++
+							default:
+								// if chain of complete nodes went to next section up
+								// then len(blocks) > number of nodes in the channel
+								break
+							}
 						}
 						// delink inserted chain section
-						self.killChain(node, parent)
+						self.killChain(node, child)
 					}
 				}
-				poolLogger.Debugf("[%x] %v/%v/%v/%v", hash[0:4], i, missing, total, depth)
+				poolLogger.Debugf("[%x] %v/%v/%v/%v", hash, i, missing, total, depth)
 				if i == lastMissing {
-					poolLogger.Debugf("[%x] done", hash[0:4])
+					poolLogger.Debugf("[%x] done", hash)
 					done = true
 				}
 			} // select
 		} // for
-		poolLogger.Debugf("[%x] quit: %v block hashes requests - %v block requests - missing %v/%v/%v", hash[0:4], blockHashesRequests, blocksRequests, missing, total, depth)
+		poolLogger.Debugf("[%x] quit: %v block hashes requests - %v block requests - missing %v/%v/%v", hash, blockHashesRequests, blocksRequests, missing, total, depth)
 
 		node.sectionLock()
 		// this signals that controller not available
 		node.section.controlC = nil
 		node.sectionUnlock()
 		self.wg.Done()
-		if cycle {
-			poolLogger.Debugf("[%x] finish cycle %v on quit", hash[0:4], cycleN)
-			self.cycleWG.Done()
+		if blocksRequestCycle {
+			poolLogger.Debugf("[%x] stop blocksRequestCycle on quit", hash[0:4])
+			self.blocksRequestCycle.stop()
+		}
+		if blockHashesRequestCycle {
+			poolLogger.Debugf("[%x] stop blockHashesRequestCycle on quit", hash[0:4])
+			self.blockHashesRequestCycle.stop()
 		}
 	}()
 
@@ -894,12 +963,14 @@ func (self *BlockPool) requestBlockHashes(hash []byte) {
 	self.peersLock.Lock()
 	defer self.peersLock.Unlock()
 	if self.peer != nil {
+		poolLogger.Debugf("request hashes starting on %x from best peer %s", hash[:4], self.peer.id)
 		self.peer.requestBlockHashes(hash)
 	}
 }
 
 func (self *BlockPool) requestBlocks(attempts int, hashes [][]byte) {
 	// distribute block request among known peers
+	poolLogger.Debugf("request blocks")
 	self.peersLock.Lock()
 	defer self.peersLock.Unlock()
 	peerCount := len(self.peers)
@@ -910,12 +981,13 @@ func (self *BlockPool) requestBlocks(attempts int, hashes [][]byte) {
 		return
 	}
 	repetitions := int(math.Min(float64(peerCount), float64(blocksRequestRepetition)))
-	poolLogger.Debugf("request %v missing blocks from %v/%v peers", len(hashes), repetitions, peerCount)
 	i := 0
 	indexes := rand.Perm(peerCount)[0:repetitions]
 	sort.Ints(indexes)
+	poolLogger.Debugf("request %v missing blocks from %v/%v peers: chosen %v", len(hashes), repetitions, peerCount, indexes)
 	for _, peer := range self.peers {
 		if i == indexes[0] {
+			poolLogger.Debugf("request %v missing blocks from %s", len(hashes), peer.id)
 			peer.requestBlocks(hashes)
 			indexes = indexes[1:]
 			if len(indexes) == 0 {
@@ -924,6 +996,8 @@ func (self *BlockPool) requestBlocks(attempts int, hashes [][]byte) {
 		}
 		i++
 	}
+	poolLogger.Debugf("done requesting blocks")
+
 }
 
 func (self *BlockPool) getPeer(peerId string) (*peerInfo, bool) {
