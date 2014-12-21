@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -24,6 +25,16 @@ type blockPoolTester struct {
 	blockChain    map[int][]int
 	blockPool     *BlockPool
 	t             *testing.T
+}
+
+func (self *blockPoolTester) Errorf(format string, params ...interface{}) {
+	fmt.Printf(format+"\n", params...)
+	self.t.Errorf(format, params...)
+}
+
+func (self *peerTester) Errorf(format string, params ...interface{}) {
+	fmt.Printf(format+"\n", params...)
+	self.t.Errorf(format, params...)
 }
 
 func (self *blockPoolTester) hasBlock(block []byte) (ok bool) {
@@ -94,13 +105,11 @@ func arrayEq(a, b []int) bool {
 	if len(a) != len(b) {
 		return false
 	}
-
 	for i := range a {
 		if a[i] != b[i] {
 			return false
 		}
 	}
-
 	return true
 }
 
@@ -112,12 +121,12 @@ func (self *blockPoolTester) checkBlockChain(blockChain map[int][]int) {
 		fmt.Printf("expected: %v -> %v\n", k, v)
 	}
 	if len(blockChain) != len(self.blockChain) {
-		self.t.Errorf("blockchain incorrect (length differ)")
+		self.Errorf("blockchain incorrect (zlength differ)")
 	}
 	for k, v := range blockChain {
 		vv, ok := self.blockChain[k]
 		if !ok || !arrayEq(v, vv) {
-			self.t.Errorf("blockchain incorrect on %v -> %v (!= %v)", k, vv, v)
+			self.Errorf("blockchain incorrect on %v -> %v (!= %v)", k, vv, v)
 		}
 	}
 
@@ -125,24 +134,87 @@ func (self *blockPoolTester) checkBlockChain(blockChain map[int][]int) {
 
 func (self *peerTester) checkBlocksRequests(blocksRequests ...[]int) {
 	if len(blocksRequests) > len(self.blocksRequests) {
-		self.t.Errorf("blocks requests incorrect (length differ)\ngot %v\nexpected %v", blocksRequests, self.blocksRequests)
-	}
-	for i, r := range blocksRequests {
-		rr := self.blocksRequests[i]
-		if !arrayEq(r, rr) {
-			self.t.Errorf("blocks requests incorrect\ngot %v\nexpected", r, rr)
+		self.Errorf("blocks requests incorrect (length differ)\ngot %v\nexpected %v", self.blocksRequests, blocksRequests)
+	} else {
+		for i, rr := range blocksRequests {
+			r := self.blocksRequests[i]
+			if !arrayEq(r, rr) {
+				self.Errorf("blocks requests incorrect\ngot %v\nexpected %v", self.blocksRequests, blocksRequests)
+			}
 		}
 	}
 }
 
-func (self *peerTester) checkBlockHashesRequests(blocksHashesRequests ...int) {
-	r := blocksHashesRequests
-	rr := self.blockHashesRequests
-	if len(r) != len(rr) {
-		self.t.Errorf("block hashes requests incorrect (length differ)\ngot %v\nexpected", r, rr)
+func (self *peerTester) waitBlocksRequests(blocksRequest ...int) {
+	rr := blocksRequest
+	fmt.Printf("blocks request check %v\n", rr)
+	self.lock.RLock()
+	r := self.blocksRequests
+	self.lock.RUnlock()
+	fmt.Printf("blocks request check %v (%v)\n", rr, r)
+	n := 0
+	i := 0
+	for {
+		for i = n; i < len(r); i++ {
+			if arrayEq(rr, r[i]) {
+				return
+			}
+		}
+		n = i
+		fmt.Printf("waiting for blocks request %v (%v)\n", rr, r)
+		ok, err := self.blockPool.HashCycle(cycleWait * time.Second)
+		if err != nil {
+			self.t.Errorf("%v", err)
+		}
+		if !ok {
+			time.Sleep(1)
+		}
+		self.lock.RLock()
+		r = self.blocksRequests
+		self.lock.RUnlock()
 	}
-	if !arrayEq(r, rr) {
-		self.t.Errorf("block hashes requests incorrect\ngot %v\nexpected", r, rr)
+}
+
+func (self *peerTester) checkBlockHashesRequests(blocksHashesRequests ...int) {
+	rr := blocksHashesRequests
+	self.lock.RLock()
+	r := self.blockHashesRequests
+	self.lock.RUnlock()
+	if len(r) != len(rr) {
+		self.Errorf("block hashes requests incorrect (length differ)\ngot %v\nexpected %v", r, rr)
+	} else {
+		if !arrayEq(r, rr) {
+			self.Errorf("block hashes requests incorrect\ngot %v\nexpected %v", r, rr)
+		}
+	}
+}
+
+func (self *peerTester) waitBlockHashesRequests(blocksHashesRequest int) {
+	rr := blocksHashesRequest
+	self.lock.RLock()
+	r := self.blockHashesRequests
+	self.lock.RUnlock()
+	fmt.Printf("block hash request check %v (%v)\n", rr, r)
+	n := 0
+	i := 0
+	for {
+		for i = n; i < len(r); i++ {
+			if rr == r[i] {
+				return
+			}
+		}
+		n = i
+		fmt.Printf("waiting for block hash request %v (%v)\n", rr, r)
+		ok, err := self.blockPool.HashCycle(cycleWait * time.Second)
+		if err != nil {
+			self.t.Errorf("%v", err)
+		}
+		if !ok {
+			time.Sleep(1)
+		}
+		self.lock.RLock()
+		r = self.blockHashesRequests
+		self.lock.RUnlock()
 	}
 }
 
@@ -203,9 +275,9 @@ type peerTester struct {
 	blockHashesRequests []int
 	blocksRequests      [][]int
 	peerErrors          []int
-	blockPool           blockPool
+	blockPool           *BlockPool
 	hashPool            *testHashPool
-	lock                sync.Mutex
+	lock                sync.RWMutex
 	id                  string
 	td                  *big.Int
 	currentBlock        int
@@ -217,8 +289,12 @@ func (self *peerTester) AddPeer() bool {
 	return self.blockPool.AddPeer(self.td, hash, self.id, self.requestBlockHashes, self.requestBlocks, self.peerError)
 }
 
-func (self *peerTester) AddBlockHashes(indexes []int) {
+func (self *peerTester) AddBlockHashes(indexes ...int) {
 	i := 0
+	fmt.Printf("ready to add block hashes %v\n", indexes)
+
+	self.waitBlockHashesRequests(indexes[0])
+	fmt.Printf("adding block hashes %v\n", indexes)
 	hashes := self.hashPool.indexesToHashes(indexes)
 	next := func() (hash []byte, ok bool) {
 		if i < len(hashes) {
@@ -232,8 +308,11 @@ func (self *peerTester) AddBlockHashes(indexes []int) {
 }
 
 func (self *peerTester) AddBlocks(indexes ...int) {
+	fmt.Printf("ready to add blocks %v\n", indexes[1:])
+	self.waitBlocksRequests(indexes[1:]...)
 	hashes := self.hashPool.indexesToHashes(indexes)
 	for i := 1; i < len(hashes); i++ {
+		fmt.Printf("adding block %v %x\n", indexes[i], hashes[i][:4])
 		self.blockPool.AddBlock(&types.Block{HeaderHash: ethutil.Bytes(hashes[i]), PrevHash: ethutil.Bytes(hashes[i-1])}, self.id)
 	}
 }
@@ -250,6 +329,7 @@ func (self *peerTester) requestBlockHashes(hash []byte) error {
 
 func (self *peerTester) requestBlocks(hashes [][]byte) error {
 	indexes := self.hashPool.hashesToIndexes(hashes)
+	fmt.Printf(" blocks request %v\n", indexes)
 	self.lock.Lock()
 	defer self.lock.Unlock()
 	self.blocksRequests = append(self.blocksRequests, indexes)
@@ -348,11 +428,8 @@ func TestAddPeer(t *testing.T) {
 	}
 
 	peer0.checkBlockHashesRequests(0, 0, 3)
-
 	peer1.checkBlockHashesRequests(1)
-
 	peer2.checkBlockHashesRequests(2)
-
 	blockPool.Stop()
 
 }
@@ -378,23 +455,39 @@ func TestSimpleChain(t *testing.T) {
 	logger.AddLogSystem(logsys)
 	_, blockPool, blockPoolTester := newTestBlockPool(t)
 	blockPoolTester.blockChain[0] = nil
-	for k, v := range blockPoolTester.blockChain {
-		fmt.Printf("%v -> %v", k, v)
-	}
 	blockPoolTester.refBlockChain[0] = []int{1}
 	blockPoolTester.refBlockChain[1] = []int{2}
 	blockPool.Start()
 
 	peer1 := blockPoolTester.newPeer("peer1", 1, 2)
 	peer1.AddPeer()
-	peer1.checkBlockHashesRequests(2)
-	peer1.AddBlockHashes([]int{2, 1, 0})
-	blockPool.cycle(cycleWait)
-	blockPool.cycle(cycleWait)
-	peer1.checkBlocksRequests([]int{1, 2})
+	peer1.AddBlockHashes(2, 1, 0)
 	peer1.AddBlocks(0, 1, 2)
-	blockPool.cycle(cycleWait)
+	blockPool.Wait(cycleWait)
+	blockPool.Stop()
 	blockPoolTester.refBlockChain[2] = []int{}
 	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
+}
+
+func TestMultiSectionChain(t *testing.T) {
+	logger.AddLogSystem(logsys)
+	_, blockPool, blockPoolTester := newTestBlockPool(t)
+	blockPoolTester.blockChain[0] = nil
+	blockPoolTester.refBlockChain[0] = []int{1}
+	blockPoolTester.refBlockChain[1] = []int{2}
+	blockPoolTester.refBlockChain[2] = []int{3}
+	blockPoolTester.refBlockChain[3] = []int{4}
+	blockPoolTester.refBlockChain[4] = []int{5}
+	blockPool.Start()
+
+	peer1 := blockPoolTester.newPeer("peer1", 1, 5)
+	peer1.AddPeer()
+	peer1.AddBlockHashes(5, 4, 3)
+	peer1.AddBlocks(2, 3, 4, 5)
+	peer1.AddBlockHashes(3, 2, 1, 0)
+	peer1.AddBlocks(0, 1, 2)
+	blockPool.Wait(cycleWait * time.Second)
 	blockPool.Stop()
+	blockPoolTester.refBlockChain[5] = []int{}
+	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
 }
