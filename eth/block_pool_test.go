@@ -573,8 +573,55 @@ func TestMidChainPeerSwitch(t *testing.T) {
 	go peer2.AddBlockHashes(3, 2, 1, 0)
 	peer2.AddBlocks(0, 1, 2)
 	blockPool.Wait(cycleWait * time.Second)
+	blockPool.Stop()
+	blockPoolTester.refBlockChain[6] = []int{}
+	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
+}
 
-	// blockPool.Stop()
+func TestMidChainPeerDownSwitch(t *testing.T) {
+	logger.AddLogSystem(logsys)
+	_, blockPool, blockPoolTester := newTestBlockPool(t)
+	blockPoolTester.blockChain[0] = nil
+	blockPoolTester.initRefBlockChain(6)
+	blockPool.Start()
+
+	peer1 := blockPoolTester.newPeer("peer1", 1, 4)
+	peer2 := blockPoolTester.newPeer("peer2", 2, 6)
+	peer2.blocksRequestsMap = peer1.blocksRequestsMap
+
+	peer2.AddPeer()
+	go peer2.AddBlockHashes(6, 5, 4)
+	peer2.AddBlocks(3, 4, 5, 6)
+	blockPool.RemovePeer("peer2")
+	peer1.AddPeer()
+	go peer1.AddBlockHashes(4, 3, 2, 1, 0)
+	go peer1.AddBlocks(0, 1, 2, 3)
+	blockPool.Wait(cycleWait * time.Second)
+	blockPool.Stop()
+	blockPoolTester.refBlockChain[6] = []int{}
+	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
+}
+
+func TestMidChainPeerSwitchesBack(t *testing.T) {
+	logger.AddLogSystem(logsys)
+	_, blockPool, blockPoolTester := newTestBlockPool(t)
+	blockPoolTester.blockChain[0] = nil
+	blockPoolTester.initRefBlockChain(6)
+	blockPool.Start()
+
+	peer1 := blockPoolTester.newPeer("peer1", 1, 4)
+	peer2 := blockPoolTester.newPeer("peer2", 2, 6)
+	peer2.blocksRequestsMap = peer1.blocksRequestsMap
+
+	peer2.AddPeer()
+	go peer2.AddBlockHashes(6, 5, 4)
+	peer2.AddBlocks(3, 4, 5, 6)
+	blockPool.RemovePeer("peer2")
+	peer2.AddPeer()
+	go peer2.AddBlockHashes(4, 3, 2, 1, 0)
+	go peer2.AddBlocks(0, 1, 2, 3)
+	blockPool.Wait(cycleWait * time.Second)
+	blockPool.Stop()
 	blockPoolTester.refBlockChain[6] = []int{}
 	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
 }
