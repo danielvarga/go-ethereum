@@ -16,7 +16,12 @@ import (
 	"github.com/ethereum/go-ethereum/pow"
 )
 
-var logsys = logger.NewStdLogSystem(os.Stdout, log.LstdFlags, logger.LogLevel(logger.DebugDetailLevel))
+const cycleWait = 10
+
+// var logsys = logger.NewStdLogSystem(os.Stdout, log.LstdFlags, logger.LogLevel(logger.InfoLevel))
+var logsys = logger.NewStdLogSystem(os.Stdout, log.LstdFlags, logger.LogLevel(logger.DebugLevel))
+
+// var logsys = logger.NewStdLogSystem(os.Stdout, log.LstdFlags, logger.LogLevel(logger.DebugDetailLevel))
 
 type blockPoolTester struct {
 	hashPool      *testHashPool
@@ -487,25 +492,26 @@ func TestPeerWithKnownBlock(t *testing.T) {
 
 	peer0 := blockPoolTester.newPeer("0", 1, 0)
 	peer0.AddPeer()
+
 	blockPool.Stop()
 	// no request on known block
 	peer0.checkBlockHashesRequests()
 }
-
-const cycleWait = 10
 
 func TestSimpleChain(t *testing.T) {
 	logger.AddLogSystem(logsys)
 	_, blockPool, blockPoolTester := newTestBlockPool(t)
 	blockPoolTester.blockChain[0] = nil
 	blockPoolTester.initRefBlockChain(2)
+
 	blockPool.Start()
 
 	peer1 := blockPoolTester.newPeer("peer1", 1, 2)
 	peer1.AddPeer()
-	peer1.AddBlockHashes(2, 1, 0)
-	peer1.AddBlocks(0, 1, 2)
-	blockPool.Wait(cycleWait)
+	go peer1.AddBlockHashes(2, 1, 0)
+	go peer1.AddBlocks(0, 1, 2)
+
+	blockPool.Wait(cycleWait * time.Second)
 	blockPool.Stop()
 	blockPoolTester.refBlockChain[2] = []int{}
 	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
@@ -516,14 +522,17 @@ func TestMultiSectionChain(t *testing.T) {
 	_, blockPool, blockPoolTester := newTestBlockPool(t)
 	blockPoolTester.blockChain[0] = nil
 	blockPoolTester.initRefBlockChain(5)
+
 	blockPool.Start()
 
 	peer1 := blockPoolTester.newPeer("peer1", 1, 5)
+
 	peer1.AddPeer()
-	peer1.AddBlockHashes(5, 4, 3)
-	peer1.AddBlocks(2, 3, 4, 5)
-	peer1.AddBlockHashes(3, 2, 1, 0)
+	go peer1.AddBlockHashes(5, 4, 3)
+	go peer1.AddBlocks(2, 3, 4, 5)
+	go peer1.AddBlockHashes(3, 2, 1, 0)
 	peer1.AddBlocks(0, 1, 2)
+
 	blockPool.Wait(cycleWait * time.Second)
 	blockPool.Stop()
 	blockPoolTester.refBlockChain[5] = []int{}
@@ -531,23 +540,26 @@ func TestMultiSectionChain(t *testing.T) {
 }
 
 func TestMidChainNewBlock(t *testing.T) {
-	// logger.AddLogSystem(logsys)
+	logger.AddLogSystem(logsys)
 	_, blockPool, blockPoolTester := newTestBlockPool(t)
 	blockPoolTester.blockChain[0] = nil
 	blockPoolTester.initRefBlockChain(6)
 	blockPool.Start()
 
 	peer1 := blockPoolTester.newPeer("peer1", 1, 4)
+
 	peer1.AddPeer()
 	go peer1.AddBlockHashes(4, 3)
-	go peer1.AddBlocks(2, 3, 4)
+	peer1.AddBlocks(2, 3, 4)
+	// peer1 found new blocks
 	peer1.td = 2
 	peer1.currentBlock = 6
 	peer1.AddPeer()
 	go peer1.AddBlockHashes(6, 5, 4)
-	go peer1.AddBlocks(4, 5, 6)
+	go peer1.AddBlocks(3, 4, 5, 6)
 	go peer1.AddBlockHashes(3, 2, 1, 0)
-	go peer1.AddBlocks(0, 1, 2)
+	peer1.AddBlocks(0, 1, 2)
+
 	blockPool.Wait(cycleWait * time.Second)
 	blockPool.Stop()
 	blockPoolTester.refBlockChain[6] = []int{}
@@ -559,19 +571,22 @@ func TestMidChainPeerSwitch(t *testing.T) {
 	_, blockPool, blockPoolTester := newTestBlockPool(t)
 	blockPoolTester.blockChain[0] = nil
 	blockPoolTester.initRefBlockChain(6)
+
 	blockPool.Start()
 
 	peer1 := blockPoolTester.newPeer("peer1", 1, 4)
+	peer2 := blockPoolTester.newPeer("peer2", 2, 6)
+	peer2.blocksRequestsMap = peer1.blocksRequestsMap
+
 	peer1.AddPeer()
 	go peer1.AddBlockHashes(4, 3)
 	peer1.AddBlocks(2, 3, 4)
-	peer2 := blockPoolTester.newPeer("peer2", 2, 6)
-	peer2.blocksRequestsMap = peer1.blocksRequestsMap
 	peer2.AddPeer()
 	go peer2.AddBlockHashes(6, 5, 4)
 	go peer2.AddBlocks(3, 4, 5, 6)
 	go peer2.AddBlockHashes(3, 2, 1, 0)
 	peer2.AddBlocks(0, 1, 2)
+
 	blockPool.Wait(cycleWait * time.Second)
 	blockPool.Stop()
 	blockPoolTester.refBlockChain[6] = []int{}
@@ -595,31 +610,35 @@ func TestMidChainPeerDownSwitch(t *testing.T) {
 	blockPool.RemovePeer("peer2")
 	peer1.AddPeer()
 	go peer1.AddBlockHashes(4, 3, 2, 1, 0)
-	go peer1.AddBlocks(0, 1, 2, 3)
+	peer1.AddBlocks(0, 1, 2, 3)
+
 	blockPool.Wait(cycleWait * time.Second)
 	blockPool.Stop()
 	blockPoolTester.refBlockChain[6] = []int{}
 	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
 }
 
-func TestMidChainPeerSwitchesBack(t *testing.T) {
+func TestMidChainPeerBestAgain(t *testing.T) {
 	logger.AddLogSystem(logsys)
 	_, blockPool, blockPoolTester := newTestBlockPool(t)
 	blockPoolTester.blockChain[0] = nil
-	blockPoolTester.initRefBlockChain(6)
+	blockPoolTester.initRefBlockChain(7)
+
 	blockPool.Start()
 
-	peer1 := blockPoolTester.newPeer("peer1", 1, 4)
-	peer2 := blockPoolTester.newPeer("peer2", 2, 6)
+	peer1 := blockPoolTester.newPeer("peer1", 2, 8)
+	peer2 := blockPoolTester.newPeer("peer2", 1, 6)
 	peer2.blocksRequestsMap = peer1.blocksRequestsMap
 
 	peer2.AddPeer()
 	go peer2.AddBlockHashes(6, 5, 4)
 	peer2.AddBlocks(3, 4, 5, 6)
-	blockPool.RemovePeer("peer2")
-	peer2.AddPeer()
+	peer1.AddPeer()
+	go peer1.AddBlockHashes(8, 7)
+	blockPool.RemovePeer("peer1")
 	go peer2.AddBlockHashes(4, 3, 2, 1, 0)
-	go peer2.AddBlocks(0, 1, 2, 3)
+	peer2.AddBlocks(0, 1, 2, 3)
+
 	blockPool.Wait(cycleWait * time.Second)
 	blockPool.Stop()
 	blockPoolTester.refBlockChain[6] = []int{}

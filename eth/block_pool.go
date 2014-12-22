@@ -20,9 +20,9 @@ var poolLogger = logger.NewLogger("Blockpool")
 const (
 	blockHashesBatchSize       = 256
 	blockBatchSize             = 64
-	blocksRequestInterval      = 100 // ms
+	blocksRequestInterval      = 50 // ms
 	blocksRequestRepetition    = 1
-	blockHashesRequestInterval = 100 // ms
+	blockHashesRequestInterval = 10 // ms
 	blocksRequestMaxIdleRounds = 10
 	cacheTimeout               = 3 // minutes
 	blockTimeout               = 5 // minutes
@@ -100,8 +100,8 @@ func (self *BlockPool) Start() {
 	self.running = true
 	self.quit = make(chan bool)
 	self.flushC = make(chan bool)
-	self.blocksRequestCycle = &cycle{c: make(chan bool), w: make(chan bool)}
-	self.blockHashesRequestCycle = &cycle{c: make(chan bool), w: make(chan bool)}
+	self.blocksRequestCycle = &cycle{name: "block", c: make(chan bool), w: make(chan bool)}
+	self.blockHashesRequestCycle = &cycle{name: "hash", c: make(chan bool), w: make(chan bool)}
 	self.pool = make(map[string]*poolNode)
 	self.lock.Unlock()
 
@@ -188,8 +188,6 @@ func (self *BlockPool) Cycle(cycle *cycle, t time.Duration) (ok bool, err error)
 	}
 	self.lock.Unlock()
 
-	poolLogger.Debugf("wait one cycle")
-
 	wait := make(chan bool)
 	go func() {
 		wait <- cycle.wait()
@@ -197,9 +195,10 @@ func (self *BlockPool) Cycle(cycle *cycle, t time.Duration) (ok bool, err error)
 
 	select {
 	case ok := <-wait:
-		poolLogger.Debugf("cycle ok = %v", ok)
+		poolLogger.Debugf("%s cycle ok = %v", cycle.name, ok)
 		return ok, nil
 	case <-time.After(t):
+		poolLogger.Debugf("%s timeout %v", cycle.name, t)
 		return false, fmt.Errorf("timeout")
 	}
 
@@ -236,7 +235,10 @@ func (self *BlockPool) AddPeer(td *big.Int, currentBlock []byte, peerId string, 
 		return false
 	}
 	node := self.get(currentBlock)
+
 	if node == nil {
+		poolLogger.Debugf("create head block %x for peer %s", currentBlock[:4], peerId)
+
 		// node created if not exist
 		node = &poolNode{
 			hash: currentBlock,
@@ -264,10 +266,10 @@ func (self *BlockPool) AddPeer(td *big.Int, currentBlock []byte, peerId string, 
 		currentTD = self.peer.td
 	}
 	if td.Cmp(currentTD) > 0 {
+		poolLogger.Debugf("peer %v promoted to best peer", peerId)
 		if self.peer != nil {
 			self.peer.stop(peer)
 		}
-		poolLogger.Debugf("peer %v promoted to best peer", peerId)
 		peer.start(self.peer)
 		self.peer = peer
 		return true
@@ -392,9 +394,6 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 						parent.RUnlock()
 					}
 					// activate the current chain
-					if blockHashesRequestCycle {
-						self.blockHashesRequestCycle.start()
-					}
 					self.activateChain(parent, peer, true, blockHashesRequestCycle)
 					poolLogger.Debugf("[%x] reached blockpool, activate chain", hash[:4])
 					break LOOP
@@ -452,44 +451,54 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 }
 
 type cycle struct {
-	i  int
-	c  chan bool
-	w  chan bool
-	wg sync.WaitGroup
-	l  sync.RWMutex
-	g  sync.Mutex
-	e  bool
+	name string
+	n    int
+	i    int
+	c    chan bool
+	w    chan bool
+	wg   sync.WaitGroup
+	l    sync.RWMutex
+	g    sync.Mutex
+	e    bool
 }
 
-func (self *cycle) wait() bool {
+func (self *cycle) wait() (any bool) {
 	self.g.Lock()
 	defer self.g.Unlock()
 	self.l.RLock()
+	poolLogger.Debugf("%s cycle %v: wait for %v cycle processes", self.name, self.i, self.n)
+	w := self.w
 	close(self.c)
 	self.l.RUnlock()
 	self.wg.Wait()
 	self.l.Lock()
 	defer self.l.Unlock()
+	poolLogger.Debugf("%s cycle %v: done with %v cycle processes", self.name, self.i, self.n)
 	self.i++
-	w := self.w
+	self.n = 0
 	self.c = make(chan bool)
 	self.w = make(chan bool)
 	close(w)
-	if self.e {
-		self.e = false
-		return true
-	}
-	return false
+	any = self.e
+	self.e = false
+	return
 }
 
 func (self *cycle) start() {
+	// no new process start while we wait
 	self.wg.Add(1)
 	self.l.Lock()
 	defer self.l.Unlock()
 	self.e = true
+	self.n++
+	poolLogger.Debugf("cycle %v: + cycle process %v", self.i, self.n)
 }
 
 func (self *cycle) stop() {
+	self.l.Lock()
+	self.n--
+	poolLogger.Debugf("cycle %v: - cycle process %v", self.i, self.n)
+	self.l.Unlock()
 	select {
 	case <-self.c: // safe read since self.c not written while stop is called
 		w := self.w
@@ -552,6 +561,9 @@ func (self *BlockPool) AddBlock(block *types.Block, peerId string) {
 // registers last section root as root for the peer (in case peer is promoted a second time, to remember)
 func (self *BlockPool) activateChain(node *poolNode, peer *peerInfo, on bool, cycle bool) {
 	self.wg.Add(1)
+	if cycle {
+		self.blockHashesRequestCycle.start()
+	}
 	poolLogger.Debugf("[%x] activate known chain for peer %s", node.hash[0:4], peer.id)
 
 	go func() {
@@ -901,10 +913,12 @@ func (self *BlockPool) processSection(node *poolNode) {
 					node.Unlock()
 					if knownParent {
 						// connected to the blockchain, insert the longest chain of blocks
+						poolLogger.Debugf("[%x] reached blockchain", hash)
 						n, err := self.addChain(node)
 						if err != nil {
 							break LOOP
 						}
+						poolLogger.Debugf("[%x] added %v blocks", hash, n)
 						// pop the inserted ancestors off the channel
 						for j := 1; j < n; j++ {
 							select {
@@ -983,7 +997,7 @@ func (self *BlockPool) addChain(node *poolNode) (n int, err error) {
 		// delink inserted chain section
 		self.killChain(node, parent)
 	}
-	n = len(blocks) - 1
+	n = len(blocks)
 	return
 }
 
@@ -1163,13 +1177,11 @@ func (self *BlockPool) link(parent, child *poolNode) {
 				// make old child orphan
 				orphan.parent = nil
 				// reset section objects above the fork
-				nchild := orphan.child
 				node := orphan
 				section := &section{bottom: orphan}
-				for node.section == nchild.section {
-					node = nchild
+				for node != nil && node.section == orphan.section {
 					node.section = section
-					nchild = node.child
+					node = node.child
 				}
 				section.top = node
 				// set up a suicide
