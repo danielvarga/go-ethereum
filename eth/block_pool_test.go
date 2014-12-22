@@ -147,31 +147,34 @@ func (self *peerTester) checkBlocksRequests(blocksRequests ...[]int) {
 
 func (self *peerTester) waitBlocksRequests(blocksRequest ...int) {
 	rr := blocksRequest
-	fmt.Printf("blocks request check %v\n", rr)
 	self.lock.RLock()
-	r := self.blocksRequests
+	r := self.blocksRequestsMap
 	self.lock.RUnlock()
 	fmt.Printf("blocks request check %v (%v)\n", rr, r)
-	n := 0
-	i := 0
 	for {
-		for i = n; i < len(r); i++ {
-			if arrayEq(rr, r[i]) {
-				return
+		self.lock.RLock()
+		i := 0
+		for i = 0; i < len(rr); i++ {
+			r = self.blocksRequestsMap
+			_, ok := r[rr[i]]
+			if !ok {
+				break
 			}
 		}
-		n = i
+		self.lock.RUnlock()
+
+		if i == len(rr) {
+			return
+		}
 		fmt.Printf("waiting for blocks request %v (%v)\n", rr, r)
 		ok, err := self.blockPool.HashCycle(cycleWait * time.Second)
 		if err != nil {
 			self.t.Errorf("%v", err)
 		}
 		if !ok {
-			time.Sleep(1)
+			time.Sleep(100 * time.Millisecond)
 		}
-		self.lock.RLock()
-		r = self.blocksRequests
-		self.lock.RUnlock()
+
 	}
 }
 
@@ -194,7 +197,7 @@ func (self *peerTester) waitBlockHashesRequests(blocksHashesRequest int) {
 	self.lock.RLock()
 	r := self.blockHashesRequests
 	self.lock.RUnlock()
-	fmt.Printf("block hash request check %v (%v)\n", rr, r)
+	fmt.Printf("[%s] block hash request check %v (%v)\n", self.id, rr, r)
 	n := 0
 	i := 0
 	for {
@@ -210,7 +213,7 @@ func (self *peerTester) waitBlockHashesRequests(blocksHashesRequest int) {
 			self.t.Errorf("%v", err)
 		}
 		if !ok {
-			time.Sleep(1)
+			time.Sleep(100 * time.Millisecond)
 		}
 		self.lock.RLock()
 		r = self.blockHashesRequests
@@ -220,12 +223,13 @@ func (self *peerTester) waitBlockHashesRequests(blocksHashesRequest int) {
 
 func (self *blockPoolTester) newPeer(id string, td int, cb int) *peerTester {
 	return &peerTester{
-		id:           id,
-		td:           big.NewInt(int64(td)),
-		currentBlock: cb,
-		hashPool:     self.hashPool,
-		blockPool:    self.blockPool,
-		t:            self.t,
+		id:                id,
+		td:                td,
+		currentBlock:      cb,
+		hashPool:          self.hashPool,
+		blockPool:         self.blockPool,
+		t:                 self.t,
+		blocksRequestsMap: make(map[int]bool),
 	}
 }
 
@@ -274,19 +278,20 @@ func (self *testHashPool) hashesToIndexes(hashes [][]byte) (indexes []int) {
 type peerTester struct {
 	blockHashesRequests []int
 	blocksRequests      [][]int
+	blocksRequestsMap   map[int]bool
 	peerErrors          []int
 	blockPool           *BlockPool
 	hashPool            *testHashPool
 	lock                sync.RWMutex
 	id                  string
-	td                  *big.Int
+	td                  int
 	currentBlock        int
 	t                   *testing.T
 }
 
 func (self *peerTester) AddPeer() bool {
 	hash := self.hashPool.indexesToHashes([]int{self.currentBlock})[0]
-	return self.blockPool.AddPeer(self.td, hash, self.id, self.requestBlockHashes, self.requestBlocks, self.peerError)
+	return self.blockPool.AddPeer(big.NewInt(int64(self.td)), hash, self.id, self.requestBlockHashes, self.requestBlocks, self.peerError)
 }
 
 func (self *peerTester) AddBlockHashes(indexes ...int) {
@@ -308,9 +313,10 @@ func (self *peerTester) AddBlockHashes(indexes ...int) {
 }
 
 func (self *peerTester) AddBlocks(indexes ...int) {
+	hashes := self.hashPool.indexesToHashes(indexes)
 	fmt.Printf("ready to add blocks %v\n", indexes[1:])
 	self.waitBlocksRequests(indexes[1:]...)
-	hashes := self.hashPool.indexesToHashes(indexes)
+	fmt.Printf("adding blocks %v \n", indexes[1:])
 	for i := 1; i < len(hashes); i++ {
 		fmt.Printf("adding block %v %x\n", indexes[i], hashes[i][:4])
 		self.blockPool.AddBlock(&types.Block{HeaderHash: ethutil.Bytes(hashes[i]), PrevHash: ethutil.Bytes(hashes[i-1])}, self.id)
@@ -321,6 +327,7 @@ func (self *peerTester) AddBlocks(indexes ...int) {
 // -1 is special: not found (a hash never seen)
 func (self *peerTester) requestBlockHashes(hash []byte) error {
 	indexes := self.hashPool.hashesToIndexes([][]byte{hash})
+	fmt.Printf("[%s] blocks hash request %v %x\n", self.id, indexes[0], hash[:4])
 	self.lock.Lock()
 	defer self.lock.Unlock()
 	self.blockHashesRequests = append(self.blockHashesRequests, indexes[0])
@@ -329,10 +336,13 @@ func (self *peerTester) requestBlockHashes(hash []byte) error {
 
 func (self *peerTester) requestBlocks(hashes [][]byte) error {
 	indexes := self.hashPool.hashesToIndexes(hashes)
-	fmt.Printf(" blocks request %v\n", indexes)
+	fmt.Printf("blocks request %v %x...\n", indexes, hashes[0][:4])
 	self.lock.Lock()
 	defer self.lock.Unlock()
 	self.blocksRequests = append(self.blocksRequests, indexes)
+	for _, i := range indexes {
+		self.blocksRequestsMap[i] = true
+	}
 	return nil
 }
 
@@ -354,37 +364,68 @@ func newTestBlockPool(t *testing.T) (hashPool *testHashPool, blockPool *BlockPoo
 }
 
 func TestAddPeer(t *testing.T) {
-	logger.AddLogSystem(logsys)
+	// logger.AddLogSystem(logsys)
 	_, blockPool, blockPoolTester := newTestBlockPool(t)
 	peer0 := blockPoolTester.newPeer("peer0", 1, 0)
 	peer1 := blockPoolTester.newPeer("peer1", 2, 1)
 	peer2 := blockPoolTester.newPeer("peer2", 3, 2)
 	blockPool.Start()
+	var peer *peerInfo
 	best := peer0.AddPeer()
 	if !best {
 		t.Errorf("peer0 (TD=1) not accepted as best")
 	}
-	peer, best := blockPool.getPeer("peer0")
-	if peer.id != "peer0" {
+	if blockPool.peer.id != "peer0" {
 		t.Errorf("peer0 (TD=1) not set as best")
 	}
+	peer0.checkBlockHashesRequests(0)
 
 	best = peer2.AddPeer()
 	if !best {
 		t.Errorf("peer2 (TD=3) not accepted as best")
 	}
-	peer, best = blockPool.getPeer("peer2")
-	if peer.id != "peer2" {
+	if blockPool.peer.id != "peer2" {
 		t.Errorf("peer2 (TD=3) not set as best")
 	}
+	peer2.checkBlockHashesRequests(2)
 
 	best = peer1.AddPeer()
 	if best {
 		t.Errorf("peer1 (TD=2) accepted as best")
 	}
-	peer, best = blockPool.getPeer("peer2")
-	if peer.id != "peer2" {
+	if blockPool.peer.id != "peer2" {
 		t.Errorf("peer2 (TD=3) not set any more as best")
+	}
+	if blockPool.peer.td.Cmp(big.NewInt(int64(3))) != 0 {
+		t.Errorf("peer1 TD not set")
+	}
+
+	peer2.td = 4
+	peer2.currentBlock = 3
+	best = peer2.AddPeer()
+	if !best {
+		t.Errorf("peer2 (TD=4) not accepted as best")
+	}
+	if blockPool.peer.id != "peer2" {
+		t.Errorf("peer2 (TD=4) not set as best")
+	}
+	if blockPool.peer.td.Cmp(big.NewInt(int64(4))) != 0 {
+		t.Errorf("peer2 TD not updated")
+	}
+	peer2.checkBlockHashesRequests(2, 3)
+
+	peer1.td = 3
+	peer1.currentBlock = 2
+	best = peer1.AddPeer()
+	if best {
+		t.Errorf("peer1 (TD=3) should not be set as best")
+	}
+	if blockPool.peer.id == "peer1" {
+		t.Errorf("peer1 (TD=3) should not be set as best")
+	}
+	peer, best = blockPool.getPeer("peer1")
+	if peer.td.Cmp(big.NewInt(int64(3))) != 0 {
+		t.Errorf("peer1 TD should be updated")
 	}
 
 	blockPool.RemovePeer("peer2")
@@ -393,10 +434,10 @@ func TestAddPeer(t *testing.T) {
 		t.Errorf("peer2 not removed")
 	}
 
-	peer, best = blockPool.getPeer("peer1")
-	if peer.id != "peer1" {
-		t.Errorf("existing peer1 (TD=2) set as best peer")
+	if blockPool.peer.id != "peer1" {
+		t.Errorf("existing peer1 (TD=3) should not be set as best peer")
 	}
+	peer1.checkBlockHashesRequests(1, 2)
 
 	blockPool.RemovePeer("peer1")
 	peer, best = blockPool.getPeer("peer1")
@@ -404,9 +445,8 @@ func TestAddPeer(t *testing.T) {
 		t.Errorf("peer1 not removed")
 	}
 
-	peer, best = blockPool.getPeer("peer0")
-	if peer.id != "peer0" {
-		t.Errorf("existing peer0 (TD=1) set as best peer")
+	if blockPool.peer.id != "peer0" {
+		t.Errorf("existing peer0 (TD=1) should be set as best peer")
 	}
 
 	blockPool.RemovePeer("peer0")
@@ -419,23 +459,20 @@ func TestAddPeer(t *testing.T) {
 	peer0.currentBlock = 3
 	best = peer0.AddPeer()
 	if !best {
-		t.Errorf("peer0 (TD=1) not accepted as best")
+		t.Errorf("peer0 (TD=1) should be set as best")
 	}
 
-	peer, best = blockPool.getPeer("peer0")
-	if peer.id != "peer0" {
-		t.Errorf("peer0 (TD=1) not set as best")
+	if blockPool.peer.id != "peer0" {
+		t.Errorf("peer0 (TD=1) should be set as best")
 	}
-
 	peer0.checkBlockHashesRequests(0, 0, 3)
-	peer1.checkBlockHashesRequests(1)
-	peer2.checkBlockHashesRequests(2)
+
 	blockPool.Stop()
 
 }
 
 func TestPeerWithKnownBlock(t *testing.T) {
-	logger.AddLogSystem(logsys)
+	// logger.AddLogSystem(logsys)
 	_, blockPool, blockPoolTester := newTestBlockPool(t)
 	blockPoolTester.refBlockChain[0] = nil
 	blockPoolTester.blockChain[0] = nil
@@ -489,5 +526,34 @@ func TestMultiSectionChain(t *testing.T) {
 	blockPool.Wait(cycleWait * time.Second)
 	blockPool.Stop()
 	blockPoolTester.refBlockChain[5] = []int{}
+	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
+}
+
+func TestMidChainNewBlock(t *testing.T) {
+	// logger.AddLogSystem(logsys)
+	_, blockPool, blockPoolTester := newTestBlockPool(t)
+	blockPoolTester.blockChain[0] = nil
+	blockPoolTester.refBlockChain[0] = []int{1}
+	blockPoolTester.refBlockChain[1] = []int{2}
+	blockPoolTester.refBlockChain[2] = []int{3}
+	blockPoolTester.refBlockChain[3] = []int{4}
+	blockPoolTester.refBlockChain[4] = []int{5}
+	blockPoolTester.refBlockChain[5] = []int{6}
+	blockPool.Start()
+
+	peer1 := blockPoolTester.newPeer("peer1", 1, 4)
+	peer1.AddPeer()
+	go peer1.AddBlockHashes(4, 3)
+	go peer1.AddBlocks(2, 3, 4)
+	peer1.td = 2
+	peer1.currentBlock = 6
+	peer1.AddPeer()
+	go peer1.AddBlockHashes(6, 5, 4)
+	go peer1.AddBlocks(4, 5, 6)
+	go peer1.AddBlockHashes(3, 2, 1, 0)
+	go peer1.AddBlocks(0, 1, 2)
+	blockPool.Wait(cycleWait * time.Second)
+	blockPool.Stop()
+	blockPoolTester.refBlockChain[6] = []int{}
 	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
 }

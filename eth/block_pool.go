@@ -212,22 +212,24 @@ func (self *BlockPool) AddPeer(td *big.Int, currentBlock []byte, peerId string, 
 
 	self.peersLock.Lock()
 	defer self.peersLock.Unlock()
-	if self.peers[peerId] != nil {
-		panic("peer already added")
+	peer, ok := self.peers[peerId]
+	if ok {
+		poolLogger.Debugf("update peer %v with td %v and current block %x", peerId, td, currentBlock[:4])
+		peer.td = td
+		peer.currentBlock = currentBlock
+	} else {
+		peer = &peerInfo{
+			td:                 td,
+			currentBlock:       currentBlock,
+			id:                 peerId, //peer.Identity().Pubkey()
+			requestBlockHashes: requestBlockHashes,
+			requestBlocks:      requestBlocks,
+			peerError:          peerError,
+			sections:           make(map[string]*section),
+		}
+		self.peers[peerId] = peer
+		poolLogger.Debugf("add new peer %v with td %v and current block %x", peerId, td, currentBlock[:4])
 	}
-
-	peer := &peerInfo{
-		td:                 td,
-		currentBlock:       currentBlock,
-		id:                 peerId, //peer.Identity().Pubkey()
-		requestBlockHashes: requestBlockHashes,
-		requestBlocks:      requestBlocks,
-		peerError:          peerError,
-		sections:           make(map[string]*section),
-	}
-	self.peers[peerId] = peer
-	poolLogger.Debugf("add new peer %v with td %v", peerId, td)
-
 	// check peer current head
 	if self.hasBlock(currentBlock) {
 		// peer not ahead
@@ -249,6 +251,13 @@ func (self *BlockPool) AddPeer(td *big.Int, currentBlock []byte, peerId string, 
 		self.set(currentBlock, node)
 	}
 	peer.addRoot(node)
+	if self.peer == peer {
+		// new block update
+		// peer is already active best peer, request hashes
+		poolLogger.Debugf("peer %v already the best peer. request hashes from %x", peerId, currentBlock[:4])
+		peer.requestBlockHashes(currentBlock)
+		return true
+	}
 
 	currentTD := ethutil.Big0
 	if self.peer != nil {
@@ -383,7 +392,10 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 						parent.RUnlock()
 					}
 					// activate the current chain
-					self.activateChain(parent, peer, true)
+					if blockHashesRequestCycle {
+						self.blockHashesRequestCycle.start()
+					}
+					self.activateChain(parent, peer, true, blockHashesRequestCycle)
 					poolLogger.Debugf("[%x] reached blockpool, activate chain", hash[:4])
 					break LOOP
 				}
@@ -433,7 +445,7 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 		poolLogger.Debugf("done adding hashes for peer %s", peerId)
 		self.wg.Done()
 		if blockHashesRequestCycle {
-			poolLogger.Debugf("end hcycle on quit")
+			poolLogger.Debugf("end blockHashesRequestCycle on quit")
 			self.blockHashesRequestCycle.stop()
 		}
 	}()
@@ -464,9 +476,9 @@ func (self *cycle) wait() bool {
 	self.w = make(chan bool)
 	close(w)
 	if self.e {
+		self.e = false
 		return true
 	}
-	self.e = false
 	return false
 }
 
@@ -538,7 +550,7 @@ func (self *BlockPool) AddBlock(block *types.Block, peerId string) {
 // on each chain section for the peer
 // stops if the peer is demoted
 // registers last section root as root for the peer (in case peer is promoted a second time, to remember)
-func (self *BlockPool) activateChain(node *poolNode, peer *peerInfo, on bool) {
+func (self *BlockPool) activateChain(node *poolNode, peer *peerInfo, on bool, cycle bool) {
 	self.wg.Add(1)
 	poolLogger.Debugf("[%x] activate known chain for peer %s", node.hash[0:4], peer.id)
 
@@ -546,8 +558,11 @@ func (self *BlockPool) activateChain(node *poolNode, peer *peerInfo, on bool) {
 	LOOP:
 		for {
 			node.sectionRLock()
+			poolLogger.Debugf("[%x] activate")
 			bottom := node.section.bottom
 			if bottom == nil { // the chain section is being created or killed
+				poolLogger.Debugf("[%x] nil bottm")
+				node.sectionRUnlock()
 				break LOOP
 			}
 			// register this section with the peer
@@ -563,13 +578,16 @@ func (self *BlockPool) activateChain(node *poolNode, peer *peerInfo, on bool) {
 			}
 			if bottom.parent == nil {
 				node = bottom
+				bottom.sectionRUnlock()
 				break LOOP
 			}
 			// if peer demoted stop activation
 			select {
 			case <-peer.quitC:
+				bottom.sectionRUnlock()
 				break LOOP
 			case <-self.quit:
+				bottom.sectionRUnlock()
 				break LOOP
 			default:
 			}
@@ -580,6 +598,9 @@ func (self *BlockPool) activateChain(node *poolNode, peer *peerInfo, on bool) {
 		// remember root for this peer if on == true
 		if on {
 			peer.addRoot(node)
+		}
+		if cycle {
+			self.blockHashesRequestCycle.stop()
 		}
 		self.wg.Done()
 	}()
@@ -878,39 +899,12 @@ func (self *BlockPool) processSection(node *poolNode) {
 					node.Unlock()
 					if knownParent {
 						// connected to the blockchain, insert the longest chain of blocks
-						var blocks types.Blocks
-						child := node
-						// iterate up along complete nodes potentially across multiple sections
-						for child != nil {
-							child.Lock()
-							if child.section == node.section && child.block != nil {
-								child.complete = true
-							}
-							if !child.complete {
-								// mark the next one (no block yet) as connected to blockchain
-								child.knownParent = true
-								child.Unlock()
-								break
-							}
-							blocks = append(blocks, child.block)
-							next := child.child
-							child.Unlock()
-							child = next
-						}
-						poolLogger.Debugf("[%x] insert %v blocks into blockchain", hash, len(blocks))
-						if err := self.insertChain(blocks); err != nil {
-							// TODO: not clear which peer we need to address
-							// peerError should dispatch to peer if still connected and disconnect
-							self.peerError(node.source, ErrInvalidBlock, "%v", err)
-							poolLogger.Debugf("invalid block %v", node.hash)
-							poolLogger.Debugf("penalise peers %v (hash), %v (block)", node.peer, node.source)
-							// penalise peer in node.source
-							self.killChain(node, nil)
-							// self.disconnect()
+						n, err := self.addChain(node)
+						if err != nil {
 							break LOOP
 						}
 						// pop the inserted ancestors off the channel
-						for j := 1; j < len(blocks); j++ {
+						for j := 1; j < n; j++ {
 							select {
 							case <-processC:
 								i++
@@ -920,8 +914,6 @@ func (self *BlockPool) processSection(node *poolNode) {
 								break
 							}
 						}
-						// delink inserted chain section
-						self.killChain(node, child)
 					}
 				}
 				poolLogger.Debugf("[%x] %v/%v/%v/%v", hash, i, missing, total, depth)
@@ -937,6 +929,7 @@ func (self *BlockPool) processSection(node *poolNode) {
 		// this signals that controller not available
 		node.section.controlC = nil
 		node.sectionUnlock()
+
 		self.wg.Done()
 		if blocksRequestCycle {
 			poolLogger.Debugf("[%x] stop blocksRequestCycle on quit", hash[0:4])
@@ -948,6 +941,48 @@ func (self *BlockPool) processSection(node *poolNode) {
 		}
 	}()
 
+}
+
+func (self *BlockPool) addChain(node *poolNode) (n int, err error) {
+	var blocks types.Blocks
+	parent := node
+	child := node
+	// iterate up along complete nodes potentially across multiple sections
+	for child != nil {
+		child.Lock()
+		if child.section == node.section && child.block != nil {
+			child.complete = true
+		}
+		if !child.complete {
+			// mark the next one (no block yet) as connected to blockchain
+			poolLogger.Debugf("[%x] marking known parent ", child.hash[:4])
+			child.knownParent = true
+			child.Unlock()
+			break
+		}
+		blocks = append(blocks, child.block)
+		parent = child
+		child = parent.child
+		parent.Unlock()
+	}
+	poolLogger.Debugf("insert %v blocks into blockchain", len(blocks))
+	err = self.insertChain(blocks)
+	if err != nil {
+		// TODO: not clear which peer we need to address
+		// peerError should dispatch to peer if still connected and disconnect
+		self.peerError(node.source, ErrInvalidBlock, "%v", err)
+		poolLogger.Debugf("invalid block %v", node.hash)
+		poolLogger.Debugf("penalise peers %v (hash), %v (block)", node.peer, node.source)
+		// penalise peer in node.source
+		self.killChain(node, nil)
+		// self.disconnect()
+
+	} else {
+		// delink inserted chain section
+		self.killChain(node, parent)
+	}
+	n = len(blocks) - 1
+	return
 }
 
 func (self *BlockPool) peerError(peerId string, code int, format string, params ...interface{}) {
@@ -1203,10 +1238,7 @@ func (self *BlockPool) killChain(node *poolNode, end *poolNode) {
 		if end != nil {
 			poolLogger.Debugf("[%x]", end.hash[0:4])
 		}
-		if orignode.section.controlC != nil {
-			close(orignode.section.controlC)
-			orignode.section.controlC = nil
-		}
+
 		delete(self.pool, string(node.hash))
 		child := node.child
 		top := node.section.top
@@ -1228,10 +1260,16 @@ func (self *BlockPool) killChain(node *poolNode, end *poolNode) {
 		}
 		if !quit {
 			if node == top {
+				// only kill section process if whole section killed
+				if node.section.controlC != nil {
+					close(node.section.controlC)
+					node.section.controlC = nil
+				}
 				if node != end && child != nil && end != nil {
 					//
 					poolLogger.Debugf("[%x] calling kill on next section\n", child.hash[0:4])
 					self.killChain(child, end)
+
 				}
 			} else {
 				if child != nil {
