@@ -695,7 +695,7 @@ func (self *BlockPool) processSection(node *poolNode) {
 							// more than once
 							idle++
 							// too many idle rounds
-							if idle > blocksRequestMaxIdleRounds {
+							if idle >= blocksRequestMaxIdleRounds {
 								poolLogger.Debugf("[%x] block requests had %v idle rounds (%v total attempts): missing %v/%v/%v\ngiving up...", hash, idle, blocksRequests, missing, total, depth)
 								self.killChain(node, nil)
 								break LOOP
@@ -775,7 +775,7 @@ func (self *BlockPool) processSection(node *poolNode) {
 
 			case <-suicideTimer:
 				self.killChain(node, nil)
-				poolLogger.Warnf("[%x] timeout. (%v total attempts): missing %v/%v/%v", hash, blocksRequests, missing, total, depth)
+				poolLogger.Debugf("[%x] timeout. (%v total attempts): missing %v/%v/%v", hash, blocksRequests, missing, total, depth)
 				break LOOP
 
 			case <-blocksRequestTimer:
@@ -867,6 +867,8 @@ func (self *BlockPool) processSection(node *poolNode) {
 					total = missing
 					depth = i
 					if depth == 0 {
+						poolLogger.Debugf("[%x] empty section", hash)
+						// self.killChain(node, end)
 						break LOOP
 					}
 					poolLogger.Debugf("[%x] section initalised: missing %v/%v/%v", hash, missing, total, depth)
