@@ -640,3 +640,40 @@ func TestMidChainPeerBestAgain(t *testing.T) {
 	blockPoolTester.refBlockChain[6] = []int{}
 	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
 }
+
+func TestFork(t *testing.T) {
+	logInit()
+	_, blockPool, blockPoolTester := newTestBlockPool(t)
+	blockPoolTester.blockChain[0] = nil
+	blockPoolTester.initRefBlockChain(3)
+	blockPoolTester.refBlockChain[3] = []int{4, 7}
+	blockPoolTester.refBlockChain[4] = []int{5}
+	blockPoolTester.refBlockChain[5] = []int{6}
+	blockPoolTester.refBlockChain[7] = []int{8}
+	blockPoolTester.refBlockChain[8] = []int{9}
+
+	blockPool.Start()
+
+	peer1 := blockPoolTester.newPeer("peer1", 1, 9)
+	peer2 := blockPoolTester.newPeer("peer2", 2, 6)
+	peer2.blocksRequestsMap = peer1.blocksRequestsMap
+
+	peer1.AddPeer()
+	go peer1.AddBlockHashes(9, 8, 7, 3, 2)
+	peer1.AddBlocks(1, 2, 3, 7, 8, 9)
+	peer2.AddPeer()
+	go peer2.AddBlockHashes(6, 5, 4, 3, 2)
+	go peer2.AddBlocks(1, 2, 3, 4, 5, 6)
+	go peer2.AddBlockHashes(2, 1, 0)
+	peer2.AddBlocks(0, 1, 2)
+
+	blockPool.Wait(cycleWait * time.Second)
+	blockPool.Stop()
+	blockPoolTester.refBlockChain[6] = []int{}
+	blockPoolTester.refBlockChain[3] = []int{4}
+	delete(blockPoolTester.refBlockChain, 7)
+	delete(blockPoolTester.refBlockChain, 8)
+	delete(blockPoolTester.refBlockChain, 9)
+	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
+
+}
