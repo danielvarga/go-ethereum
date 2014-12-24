@@ -349,20 +349,19 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 				// look up node in pool
 				parent := self.get(hash)
 				if parent != nil {
-					poolLogger.Debugf("[%x] found node", hash[:4])
+					poolLogger.Debugf("[%x] found block", hash[:4])
 					var fork bool
 					// reached a known chain in the pool
 					if child != nil {
 						poolLogger.Debugf("[%x] reached blockpool chain", hash[:4])
 						fork = self.link(parent, child)
-						// poolLogger.Debugf("potential chain of %v blocks added", depth)
 					} else {
 						// we expect the first block to be known, only continue if has no parent
-						poolLogger.Debugf("[%x] chain head is known", hash[:4])
+						poolLogger.Debugf("[%x] first hash is known", hash[:4])
 						parent.RLock()
 						if parent.parent == nil {
 							// the first block hash received is an orphan in the pool, so rejoice and continue
-							poolLogger.Debugf("[%x] chain head is orphan block, keep building", hash[:4])
+							poolLogger.Debugf("[%x] first hash is orphan block, keep building", hash[:4])
 							depth++
 							child = parent
 							parent.RUnlock()
@@ -614,6 +613,7 @@ func (self *BlockPool) processSection(node *poolNode) {
 				ready = true
 				done = false
 				// save a new processC (blocks still missing)
+				poolLogger.Debugf("[%x] offC = missingC %v", missingC)
 				offC = missingC
 				missingC = processC
 				// put processC offline
@@ -687,9 +687,10 @@ func (self *BlockPool) processSection(node *poolNode) {
 					blocksRequestTimer = nil
 					blockHashesRequestTime = false
 					blockHashesRequestTimer = nil
-					offC = processC
-					processC = nil
-
+					if processC != nil {
+						offC = processC
+						processC = nil
+					}
 					poolLogger.Debugf("[%x] idle mode on", hash)
 				}
 				if !running && r {
@@ -714,8 +715,6 @@ func (self *BlockPool) processSection(node *poolNode) {
 						i = 0
 						total = 0
 						lastMissing = 0
-					} else {
-						processC = offC
 					}
 				}
 
@@ -826,6 +825,10 @@ func (self *BlockPool) addChain(node *poolNode) (n int, err error) {
 			// mark the next one (no block yet) as connected to blockchain
 			poolLogger.Debugf("[%x] marking known parent ", child.hash[:4])
 			child.knownParent = true
+			if node.section != child.section {
+				poolLogger.Debugf("[%x] restart idle section", child.hash[:4])
+				child.section.controlC <- true
+			}
 			child.Unlock()
 			break
 		}
