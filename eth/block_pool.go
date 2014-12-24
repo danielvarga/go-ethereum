@@ -483,18 +483,17 @@ func (self *BlockPool) activateChain(node *poolNode, peer *peerInfo, on bool, re
 				peer.addSection(bottom.hash, bottom.section)
 				if bottom.section.controlC != nil {
 					poolLogger.Debugf("[%x] restart section process", bottom.hash[:4])
-					bottom.section.controlC <- on
 					if i == 0 && reinit {
 						// starting from mid section node
 						poolLogger.Debugf("[%x] reinitialise section", bottom.hash[:4])
 						bottom.section.resetC <- true
 					}
+					bottom.section.controlC <- on
 					poolLogger.Debugf("[%x] start section process - active %v", bottom.hash[:4], on)
 				}
 				// if complete no need to reset
 			}
 			i++
-			// if peer demoted stop activation
 			select {
 			case <-peer.quitC:
 				bottom.sectionRUnlock()
@@ -722,8 +721,6 @@ func (self *BlockPool) processSection(node *poolNode) {
 				poolLogger.Debugf("[%x] reinit section", hash)
 				init = false
 				done = false
-				missingC = nil
-				processC = nil
 
 			case node, ok := <-processC:
 				if !ok && !init {
