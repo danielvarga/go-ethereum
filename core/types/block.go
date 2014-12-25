@@ -59,19 +59,7 @@ func (self *Header) RlpData() interface{} {
 }
 
 func (self *Header) Hash() []byte {
-	if self.HeaderHash != nil {
-		return self.HeaderHash
-	} else {
-		return crypto.Sha3(ethutil.Encode(self.rlpData(true)))
-	}
-}
-
-func (self *Block) ParentHash() []byte {
-	if self.ParentHeaderHash != nil {
-		return self.ParentHeaderHash
-	} else {
-		return self.header.ParentHash
-	}
+	return crypto.Sha3(ethutil.Encode(self.rlpData(true)))
 }
 
 func (self *Header) HashNoNonce() []byte {
@@ -79,7 +67,7 @@ func (self *Header) HashNoNonce() []byte {
 }
 
 type Block struct {
-	// Preset Hashes for mocking
+	// Preset Hash for mock
 	HeaderHash       []byte
 	ParentHeaderHash []byte
 	header           *Header
@@ -209,16 +197,29 @@ func (self *Block) Coinbase() []byte          { return self.header.Coinbase }
 func (self *Block) Time() int64               { return int64(self.header.Time) }
 func (self *Block) GasLimit() *big.Int        { return self.header.GasLimit }
 func (self *Block) GasUsed() *big.Int         { return self.header.GasUsed }
-func (self *Block) Hash() []byte              { return self.header.Hash() }
 func (self *Block) Trie() *ptrie.Trie         { return ptrie.New(self.header.Root, ethutil.Config.Db) }
 func (self *Block) State() *state.StateDB     { return state.New(self.Trie()) }
 func (self *Block) Size() ethutil.StorageSize { return ethutil.StorageSize(len(ethutil.Encode(self))) }
 
-// Implement block.Pow
+// Implement pow.Block
 func (self *Block) Difficulty() *big.Int { return self.header.Difficulty }
 func (self *Block) N() []byte            { return self.header.Nonce }
-func (self *Block) HashNoNonce() []byte {
-	return crypto.Sha3(ethutil.Encode(self.header.rlpData(false)))
+func (self *Block) HashNoNonce() []byte  { return self.header.HashNoNonce() }
+
+func (self *Block) Hash() []byte {
+	if self.HeaderHash != nil {
+		return self.HeaderHash
+	} else {
+		return self.header.Hash()
+	}
+}
+
+func (self *Block) ParentHash() []byte {
+	if self.ParentHeaderHash != nil {
+		return self.ParentHeaderHash
+	} else {
+		return self.header.ParentHash
+	}
 }
 
 func (self *Block) String() string {

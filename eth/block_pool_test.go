@@ -62,7 +62,7 @@ func (self *blockPoolTester) insertChain(blocks types.Blocks) error {
 			fmt.Printf("block %v already in blockchain\n", child)
 			continue // already in chain
 		}
-		parent = self.hashPool.hashesToIndexes([][]byte{block.PrevHash})[0]
+		parent = self.hashPool.hashesToIndexes([][]byte{block.ParentHeaderHash})[0]
 		children, ok = self.blockChain[parent]
 		if !ok {
 			return fmt.Errorf("parent %v not in blockchain ", parent)
@@ -307,7 +307,7 @@ func (self *peerTester) AddBlocks(indexes ...int) {
 	fmt.Printf("adding blocks %v \n", indexes[1:])
 	for i := 1; i < len(hashes); i++ {
 		fmt.Printf("adding block %v %x\n", indexes[i], hashes[i][:4])
-		self.blockPool.AddBlock(&types.Block{HeaderHash: ethutil.Bytes(hashes[i]), PrevHash: ethutil.Bytes(hashes[i-1])}, self.id)
+		self.blockPool.AddBlock(&types.Block{HeaderHash: ethutil.Bytes(hashes[i]), ParentHeaderHash: ethutil.Bytes(hashes[i-1])}, self.id)
 	}
 }
 
