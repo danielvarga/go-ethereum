@@ -18,10 +18,7 @@ import (
 
 const cycleWait = 60 // seconds
 
-// var logsys = logger.NewStdLogSystem(os.Stdout, log.LstdFlags, logger.LogLevel(logger.InfoLevel))
 var logsys = logger.NewStdLogSystem(os.Stdout, log.LstdFlags, logger.LogLevel(logger.DebugLevel))
-
-// var logsys = logger.NewStdLogSystem(os.Stdout, log.LstdFlags, logger.LogLevel(logger.DebugDetailLevel))
 
 type blockPoolTester struct {
 	hashPool      *testHashPool
@@ -96,13 +93,6 @@ func (self *blockPoolTester) insertChain(blocks types.Blocks) error {
 }
 
 func (self *blockPoolTester) verifyPoW(pblock pow.Block) bool {
-	// block, _ := pblock.(*types.Block)
-	// i := self.hashPool.hashesToIndexes([][]byte{block.Hash()})[0]
-	// for _, j := range self.invalidPoWhashes {
-	// 	if i == j {
-	// 		return false
-	// 	}
-	// }
 	return true
 }
 
@@ -645,12 +635,9 @@ func TestFork(t *testing.T) {
 	logInit()
 	_, blockPool, blockPoolTester := newTestBlockPool(t)
 	blockPoolTester.blockChain[0] = nil
-	blockPoolTester.initRefBlockChain(3)
+	blockPoolTester.initRefBlockChain(9)
 	blockPoolTester.refBlockChain[3] = []int{4, 7}
-	blockPoolTester.refBlockChain[4] = []int{5}
-	blockPoolTester.refBlockChain[5] = []int{6}
-	blockPoolTester.refBlockChain[7] = []int{8}
-	blockPoolTester.refBlockChain[8] = []int{9}
+	delete(blockPoolTester.refBlockChain, 6)
 
 	blockPool.Start()
 
@@ -676,4 +663,116 @@ func TestFork(t *testing.T) {
 	delete(blockPoolTester.refBlockChain, 9)
 	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
 
+}
+
+func TestParallelChains(t *testing.T) {
+	logInit()
+	_, blockPool, blockPoolTester := newTestBlockPool(t)
+	blockPoolTester.blockChain[0] = nil
+	blockPoolTester.initRefBlockChain(11)
+	blockPoolTester.refBlockChain[3] = []int{4, 7}
+	delete(blockPoolTester.refBlockChain, 6)
+
+	blockPool.Start()
+
+	peer1 := blockPoolTester.newPeer("peer1", 1, 9)
+	peer2 := blockPoolTester.newPeer("peer2", 2, 6)
+	peer2.blocksRequestsMap = peer1.blocksRequestsMap
+
+	peer1.AddPeer()
+	go peer1.AddBlockHashes(9, 8)
+	peer1.AddBlocks(7, 8, 9)
+	peer2.AddPeer()
+	go peer2.AddBlockHashes(6, 5)
+	peer2.AddBlocks(4, 5, 6)
+	blockPool.RemovePeer("peer2")
+
+	go peer1.AddBlockHashes(8, 7, 3)
+	peer1.AddBlocks(2, 3, 7, 8)
+	peer2.AddPeer()
+	peer2.AddBlockHashes(5, 4, 3)
+
+	peer1.td = 3
+	peer1.currentBlock = 11
+	peer1.AddPeer()
+	go peer1.AddBlockHashes(11, 10, 9, 8)
+	go peer1.AddBlocks(7, 8, 9, 10, 11)
+	go peer1.AddBlockHashes(3, 2, 1, 0)
+	peer1.AddBlocks(0, 1, 2, 3)
+
+	blockPool.Wait(cycleWait * time.Second)
+	blockPool.Stop()
+	blockPoolTester.refBlockChain[11] = []int{}
+	blockPoolTester.refBlockChain[3] = []int{7}
+	delete(blockPoolTester.refBlockChain, 6)
+	delete(blockPoolTester.refBlockChain, 5)
+	delete(blockPoolTester.refBlockChain, 4)
+	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
+
+}
+
+func TestInvalidBlock(t *testing.T) {
+	logInit()
+	_, blockPool, blockPoolTester := newTestBlockPool(t)
+	blockPoolTester.blockChain[0] = nil
+	blockPoolTester.initRefBlockChain(2)
+	blockPoolTester.refBlockChain[2] = []int{}
+
+	blockPool.Start()
+
+	peer1 := blockPoolTester.newPeer("peer1", 1, 3)
+	peer1.AddPeer()
+	go peer1.AddBlockHashes(3, 2, 1, 0)
+	peer1.AddBlocks(0, 1, 2, 3)
+
+	blockPool.Wait(cycleWait * time.Second)
+	blockPool.Stop()
+	blockPoolTester.refBlockChain[2] = []int{}
+	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
+	if len(peer1.peerErrors) == 1 {
+		if peer1.peerErrors[0] != ErrInvalidBlock {
+			t.Errorf("wrong error, got %v, expected %v", peer1.peerErrors[0], ErrInvalidBlock)
+		}
+	} else {
+		t.Errorf("expected invalid block error, got nothing")
+	}
+}
+
+func TestVerifyPoW(t *testing.T) {
+	logInit()
+	_, blockPool, blockPoolTester := newTestBlockPool(t)
+	blockPoolTester.blockChain[0] = nil
+	blockPoolTester.initRefBlockChain(3)
+	first := false
+	blockPoolTester.blockPool.verifyPoW = func(b pow.Block) bool {
+		bb, _ := b.(*types.Block)
+		indexes := blockPoolTester.hashPool.hashesToIndexes([][]byte{bb.Hash()})
+		if indexes[0] == 1 && !first {
+			first = true
+			return false
+		} else {
+			return true
+		}
+
+	}
+
+	blockPool.Start()
+
+	peer1 := blockPoolTester.newPeer("peer1", 1, 2)
+	peer1.AddPeer()
+	go peer1.AddBlockHashes(2, 1, 0)
+	peer1.AddBlocks(0, 1, 2)
+	peer1.AddBlocks(0, 1)
+
+	blockPool.Wait(cycleWait * time.Second)
+	blockPool.Stop()
+	blockPoolTester.refBlockChain[2] = []int{}
+	blockPoolTester.checkBlockChain(blockPoolTester.refBlockChain)
+	if len(peer1.peerErrors) == 1 {
+		if peer1.peerErrors[0] != ErrInvalidPoW {
+			t.Errorf("wrong error, got %v, expected %v", peer1.peerErrors[0], ErrInvalidPoW)
+		}
+	} else {
+		t.Errorf("expected invalid pow error, got nothing")
+	}
 }

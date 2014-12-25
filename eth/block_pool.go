@@ -537,7 +537,6 @@ func (self *BlockPool) processSection(node *poolNode) {
 	node.sectionRUnlock()
 
 	self.wg.Add(1)
-	// self.procWg.Add(1)
 	go func() {
 		// absolute time after which sub-chain is killed if not complete (some blocks are missing)
 		suicideTimer := time.After(blockTimeout * time.Minute)
@@ -612,7 +611,6 @@ func (self *BlockPool) processSection(node *poolNode) {
 				ready = true
 				done = false
 				// save a new processC (blocks still missing)
-				poolLogger.Debugf("[%x] offC = missingC %v", missingC)
 				offC = missingC
 				missingC = processC
 				// put processC offline
@@ -804,6 +802,7 @@ func (self *BlockPool) processSection(node *poolNode) {
 		if running {
 			self.procWg.Done()
 		}
+		poolLogger.Debugf("[%x] process complete", hash)
 	}()
 
 }
@@ -840,7 +839,7 @@ func (self *BlockPool) addChain(node *poolNode) (n int, err error) {
 		// TODO: not clear which peer we need to address
 		// peerError should dispatch to peer if still connected and disconnect
 		self.peerError(node.source, ErrInvalidBlock, "%v", err)
-		poolLogger.Debugf("invalid block %v", node.hash)
+		poolLogger.Debugf("invalid block %x", node.hash)
 		poolLogger.Debugf("penalise peers %v (hash), %v (block)", node.peer, node.source)
 		// penalise peer in node.source
 		self.killChain(node, nil)
@@ -1092,7 +1091,6 @@ func (self *BlockPool) link(parent, child *poolNode) (fork bool) {
 		child.sectionUnlock()
 	}
 	poolLogger.Debugf("link %x - %x done", parent.hash[:4], child.hash[:4])
-	poolLogger.Debugf("parent section: %x - %x", parent.section.bottom.hash[:4], parent.section.top.hash[:4])
 	return
 }
 
