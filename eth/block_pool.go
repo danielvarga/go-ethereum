@@ -223,9 +223,7 @@ func (self *BlockPool) AddPeer(td *big.Int, currentBlock []byte, peerId string, 
 			td:   td,
 		}
 		node.section = &section{
-			controlC: make(chan bool, 1),
-			resetC:   make(chan bool, 1),
-			top:      node,
+			top: node,
 		}
 		self.set(currentBlock, node)
 	}
@@ -310,6 +308,7 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 		var child *poolNode
 		var depth int
 		var firstHash []byte
+		var processSection bool
 
 	LOOP:
 		for {
@@ -332,6 +331,7 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 					if self.hasBlock(hash) {
 						// check if known block connecting the downloaded chain to our blockchain
 						poolLogger.Debugf("[%x] known block", hash[0:4])
+						// mark child as absolute pool root with parent known to blockchain
 						knownParent = true
 						ok = false
 					}
@@ -339,7 +339,6 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 				if !ok {
 					if child != nil {
 						child.Lock()
-						// mark child as absolute pool root with parent known to blockchain
 						child.knownParent = knownParent
 						child.section.bottom = child
 						child.Unlock()
@@ -362,7 +361,7 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 						if parent.parent == nil {
 							// the first block hash received is an orphan in the pool, so rejoice and continue
 							poolLogger.Debugf("[%x] first hash is orphan block, keep building", hash[:4])
-							depth++
+							processSection = true
 							child = parent
 							parent.RUnlock()
 							continue LOOP
@@ -382,14 +381,15 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 				}
 				poolLogger.Debugf("[%x] -> orphan %x", hash[:4], child.hash[:4])
 				child.Lock()
-				if depth > 1 || child.child == nil {
+				if child.child == nil {
+					depth++
+				}
+				if depth > 0 {
 					parent.section = child.section
 					poolLogger.Debugf("[%x] -> %x inherit section", hash[:4], child.hash[:4])
 				} else {
 					parent.section = &section{
-						controlC: make(chan bool),
-						resetC:   make(chan bool),
-						top:      parent,
+						top: parent,
 					}
 					poolLogger.Debugf("[%x] -> %x new section", hash[:4], child.hash[:4])
 				}
@@ -403,18 +403,13 @@ func (self *BlockPool) AddBlockHashes(next func() ([]byte, bool), peerId string)
 
 			} // select
 		} //for
-		poolLogger.Debugf("[%s][%x] done adding hashes", peerId, firstHash[:4])
 		self.wg.Done()
 		self.procWg.Done()
-		if child != nil {
-			poolLogger.Debugf("[%x]-[%x] chain section of %v hashes added by peer %s", child.hash[:4], firstHash[:4], depth, peerId)
-			// start a processSection on the last node, but switch off asking
-			// hashes and blocks until next peer confirms this chain
-			// or blocks are all received
-
-			self.processSection(child)
-			peer.addSection(child.hash, child.section)
-			child.section.start()
+		poolLogger.Debugf("[%x-%x] chain section of %v hashes added by peer %s", child.hash[:4], firstHash[:4], depth, peerId)
+		if processSection {
+			section := self.processSection(child)
+			peer.addSection(child.hash, section)
+			section.start()
 		}
 	}()
 }
@@ -466,7 +461,6 @@ func (self *BlockPool) activateChain(node *poolNode, peer *peerInfo, on bool, re
 	self.wg.Add(1)
 	self.procWg.Add(1)
 	poolLogger.Debugf("[%x] activate known chain for peer %s", node.hash[:4], peer.id)
-
 	go func() {
 		i := 0
 	LOOP:
@@ -477,19 +471,22 @@ func (self *BlockPool) activateChain(node *poolNode, peer *peerInfo, on bool, re
 				node.sectionRUnlock()
 				break LOOP
 			}
-			poolLogger.Debugf("[%x] activate %x - %x ", node.hash[:4], bottom.hash[:4], node.section.top.hash[:4])
+			poolLogger.Debugf("[%x-%x] activate", bottom.hash[:4], node.section.top.hash[:4])
 			// register this section with the peer
 			if peer != nil {
 				peer.addSection(bottom.hash, bottom.section)
 				if bottom.section.controlC != nil {
-					poolLogger.Debugf("[%x] restart section process", bottom.hash[:4])
+					poolLogger.Debugf("[%x-%x] restart section process", bottom.hash[:4], node.section.top.hash[:4])
 					if i == 0 && reinit {
 						// starting from mid section node
-						poolLogger.Debugf("[%x] reinitialise section", bottom.hash[:4])
+						poolLogger.Debugf("[%x-%x] reinitialise section", bottom.hash[:4], node.section.top.hash[:4])
+						bottom.section.controlC <- false
 						bottom.section.resetC <- true
 					}
 					bottom.section.controlC <- on
-					poolLogger.Debugf("[%x] start section process - active %v", bottom.hash[:4], on)
+					poolLogger.Debugf("[%x-%x] start section process - active %v", bottom.hash[:4], node.section.top.hash[:4], on)
+				} else {
+					poolLogger.Debugf("[%x-%x] found section process complete", bottom.hash[:4], node.section.top.hash[:4])
 				}
 				// if complete no need to reset
 			}
@@ -513,9 +510,9 @@ func (self *BlockPool) activateChain(node *poolNode, peer *peerInfo, on bool, re
 		// remember root for this peer if on == true
 		if on && peer != nil {
 			poolLogger.Debugf("[%x] add orphan", node.hash[0:4])
+			peer.requestBlockHashes(node.hash)
 			peer.addRoot(node)
 		}
-		poolLogger.Debugf("[%x] activate", node.hash[0:4])
 		self.wg.Done()
 		self.procWg.Done()
 	}()
@@ -529,12 +526,18 @@ func (self *BlockPool) activateChain(node *poolNode, peer *peerInfo, on bool, re
 // - when turned off (if peer disconnects and new peer connects with alternative chain), no blockrequests are made but absolute expiry timer is ticking
 // - when turned back on it recursively calls itself on the root of the next chain section
 // - when exits, signals to
-func (self *BlockPool) processSection(node *poolNode) {
+func (self *BlockPool) processSection(node *poolNode) (section *section) {
 
-	node.sectionRLock()
-	controlC := node.section.controlC
-	resetC := node.section.resetC
-	node.sectionRUnlock()
+	node.Lock()
+	defer node.Unlock()
+	section = node.section
+	if section.controlC != nil {
+		return
+	}
+	controlC := make(chan bool, 1)
+	resetC := make(chan bool, 1)
+	section.controlC = controlC
+	section.resetC = resetC
 
 	self.wg.Add(1)
 	go func() {
@@ -621,10 +624,7 @@ func (self *BlockPool) processSection(node *poolNode) {
 			if ready && blocksRequestTime {
 				poolLogger.Debugf("[%x] check if new blocks arrived (attempt %v): missing %v/%v/%v", hash, blocksRequests, missing, total, depth)
 				blocksRequestTimer = time.After(blocksRequestInterval * time.Millisecond)
-				i = 0
-				missing = 0
 				blocksRequestTime = false
-				ready = false
 				processC = offC
 			}
 			if blockHashesRequestTime {
@@ -708,10 +708,15 @@ func (self *BlockPool) processSection(node *poolNode) {
 						// if not run at least once fully, launch iterator
 						processC = make(chan *poolNode, blockHashesBatchSize)
 						missingC = make(chan *poolNode, blockHashesBatchSize)
+						poolLogger.Debugf("[%x] initialise section", hash)
 						self.foldUp(blockHashesRequestRoot, processC)
 						i = 0
+						missing = 0
 						total = 0
 						lastMissing = 0
+						depth = 0
+					} else {
+						processC = offC
 					}
 				}
 
@@ -719,6 +724,7 @@ func (self *BlockPool) processSection(node *poolNode) {
 				poolLogger.Debugf("[%x] reinit section", hash)
 				init = false
 				done = false
+				ready = false
 
 			case node, ok := <-processC:
 				if !ok && !init {
@@ -736,6 +742,11 @@ func (self *BlockPool) processSection(node *poolNode) {
 					}
 					poolLogger.Debugf("[%x] section initalised: missing %v/%v/%v", hash, missing, total, depth)
 					continue LOOP
+				}
+				if ready {
+					i = 0
+					missing = 0
+					ready = false
 				}
 				poolLogger.Debugf("[%x] process node %v [%x]", hash, i, node.hash[:4])
 				i++
@@ -804,7 +815,7 @@ func (self *BlockPool) processSection(node *poolNode) {
 		}
 		poolLogger.Debugf("[%x] process complete", hash)
 	}()
-
+	return
 }
 
 func (self *BlockPool) addChain(node *poolNode) (n int, err error) {
@@ -1025,6 +1036,8 @@ func (self *BlockPool) link(parent, child *poolNode) (fork bool) {
 				orphan.lock.Lock()
 				// make old child orphan
 				orphan.parent = nil
+				poolLogger.Debugf("inactivate section %x-%x", orphan.hash[:4], orphan.section.top.hash[:4])
+				orphan.section.stop()
 				orphan.lock.Unlock()
 			} else { // we are under section lock
 				// make old child orphan
@@ -1033,15 +1046,21 @@ func (self *BlockPool) link(parent, child *poolNode) (fork bool) {
 				orphan.parent = nil
 				// reset section objects above the fork
 				node := orphan
-				section := &section{bottom: orphan}
-				for node != nil && node.section == orphan.section {
+				topnode := node
+				section := &section{
+					bottom: orphan,
+				}
+				orphansection := orphan.section
+				for node != nil && node.section == orphansection {
+					poolLogger.Debugf("-> new section for %x (%x-%x)", node.hash[:4], node.section.bottom.hash[:4], node.section.top.hash[:4])
 					node.section = section
+					topnode = node
 					node = node.child
 				}
-				section.top = node
+				section.top = topnode
 				// set up a suicide
-				self.processSection(orphan)
-				orphan.section.stop()
+				poolLogger.Debugf("set up suicide for new section %x-%x", orphan.hash[:4], topnode.hash[:4])
+				self.processSection(orphan).stop()
 			}
 		} else {
 			// child is on top of a chain need to close section
@@ -1051,9 +1070,8 @@ func (self *BlockPool) link(parent, child *poolNode) (fork bool) {
 		// adopt new child
 		parent.child = child
 		if !top {
-			poolLogger.Debugf("parent is mid section %x (%x-%x): split section", parent.hash[:4], parent.section.bottom.hash[:4], parent.section.top.hash[:4])
-			poolLogger.Debugf("parent is mid section %x: split section", parent.hash[:4])
 			parent.section.top = parent
+			poolLogger.Debugf("parent is mid section %x (%x-%x): split section", parent.hash[:4], parent.section.bottom.hash[:4], parent.section.top.hash[:4])
 			// restart section process so that shorter section is scanned for blocks
 		}
 	}
@@ -1073,7 +1091,9 @@ func (self *BlockPool) link(parent, child *poolNode) (fork bool) {
 				// need to split, no need to lock
 				stepParent.child = nil
 				node := stepParent
-				section := &section{top: stepParent}
+				section := &section{
+					top: stepParent,
+				}
 				for node != nil && node.section == stepParent.section {
 					node.section = section
 					node = node.parent
@@ -1132,6 +1152,7 @@ func (self *BlockPool) killChain(node *poolNode, end *poolNode) {
 				// only kill section process if whole section killed
 				if node.section.controlC != nil {
 					close(node.section.controlC)
+					poolLogger.Debugf("[%x] killing block\n", node.hash[0:4])
 					node.section.controlC = nil
 				}
 				if node != end && child != nil && end != nil {
